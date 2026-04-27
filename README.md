@@ -88,6 +88,26 @@ CE ships with **built-in local LLM inference** via the embedded
 to install for AI chat, NL2SQL, or embedding generation to work. CE uses
 quantized GGUF models loaded in-process.
 
+**No GPU required.** The published CE binaries are CPU-only — no CUDA,
+Metal, Vulkan, or OpenCL backends are linked in. Performance bands you
+can expect on a 7B-parameter Q4\_K\_M model:
+
+| Hardware | Tokens/sec |
+| --- | --- |
+| Apple Silicon M1/M2/M3/M4 | 30–80 |
+| Modern x86 with AVX2 (Zen 3+, Intel 11th gen+) | 5–15 |
+| Older x86 without AVX2 | 1–3 (painful for chat) |
+| Linux ARM (Graviton, Pi 5) | 3–8 |
+
+For embedding-only workloads (semantic search, vector indexing) — much
+lighter, 384/768-dim models run in tens of milliseconds even on a Pi.
+
+If you need GPU-accelerated inference (e.g. a 70B model in real time),
+build SynapCores from source with `--features llama-cpp/cuda` (or
+`metal`, `vulkan`) — pre-built GPU binaries are not distributed because
+the cross-product of CUDA versions and driver versions is unmanageable
+across distros.
+
 ### Ollama is *not* required and *not* installed
 
 [Ollama](https://ollama.com) is **optional**. The installer does not
@@ -108,7 +128,7 @@ not installer dependencies.
 
 1. Detects the host OS + architecture
 2. Resolves the latest SynapCores CE release from
-   [`mataluis2k/aidb` GitHub Releases](https://github.com/mataluis2k/aidb/releases)
+   [`SynapCores/synapcores-releases` GitHub Releases](https://github.com/SynapCores/synapcores-releases/releases)
    (or honors `SYNAPCORES_VERSION=vX.Y.Z`)
 3. Downloads the matching tarball + SHA-256 checksum and verifies them
 4. Installs `synapcores` to `/usr/local/bin`
@@ -117,13 +137,20 @@ not installer dependencies.
    hardened systemd unit (`NoNewPrivileges`, `ProtectSystem=strict`,
    `LimitNOFILE=65536`)
 
+## How releases reach users
+
+Source code is **not** in this repo or any other public repo — SynapCores
+is proprietary. The release pipeline lives in the private source
+repository and pushes signed binary artifacts to a separate public repo
+([`SynapCores/synapcores-releases`](https://github.com/SynapCores/synapcores-releases/releases))
+on every tag. This `install.sh` knows how to find them there.
+
 ## Updating the script
 
-The canonical source lives at
-[`mataluis2k/aidb:scripts/install/get-synapcores-ce.sh`](https://github.com/mataluis2k/aidb/blob/release/community-edition-v1/scripts/install/get-synapcores-ce.sh).
-
-When that script changes, copy the new contents into this repo's `install.sh`
-on `main` and the GitHub Pages cache will pick it up within a few minutes.
+The canonical source for this installer lives in the private source
+repository at `scripts/install/get-synapcores-ce.sh`. When that changes,
+copy the new contents into this repo's `install.sh` on `main` and the
+GitHub Pages cache will pick it up within a few minutes.
 
 ## DNS
 

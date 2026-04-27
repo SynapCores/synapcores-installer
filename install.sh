@@ -33,7 +33,7 @@ set -euo pipefail
 # Configuration
 # ---------------------------------------------------------------------
 
-GITHUB_REPO="${SYNAPCORES_REPO:-mataluis2k/aidb}"
+GITHUB_REPO="${SYNAPCORES_REPO:-SynapCores/synapcores-releases}"
 RELEASE_BASE="https://github.com/${GITHUB_REPO}/releases"
 PINNED_VERSION="${SYNAPCORES_VERSION:-}"
 INSTALL_PREFIX="${SYNAPCORES_PREFIX:-/usr/local/bin}"
