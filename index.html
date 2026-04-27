@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SynapCores — Community Edition installer</title>
+  <meta name="description" content="One-line installer for SynapCores Community Edition.">
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #0f1419;
+      --fg: #e6e1cf;
+      --muted: #5c6773;
+      --accent: #59c2ff;
+      --code-bg: #1f2430;
+    }
+    @media (prefers-color-scheme: light) {
+      :root { --bg: #fafafa; --fg: #1f2329; --muted: #6b7785; --code-bg: #eef0f3; }
+    }
+    body {
+      margin: 0;
+      padding: 4rem 1.5rem;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--fg);
+      line-height: 1.6;
+    }
+    main { max-width: 720px; margin: 0 auto; }
+    h1 { font-size: 2rem; margin: 0 0 0.5rem; letter-spacing: -0.02em; }
+    h2 { font-size: 1.1rem; margin: 2.5rem 0 0.5rem; color: var(--accent); }
+    p, li { color: var(--fg); }
+    .lede { color: var(--muted); margin: 0 0 2rem; }
+    pre {
+      background: var(--code-bg);
+      padding: 1rem 1.25rem;
+      border-radius: 8px;
+      overflow-x: auto;
+      font-size: 0.95rem;
+    }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    p code { background: var(--code-bg); padding: 0.1em 0.4em; border-radius: 4px; font-size: 0.92em; }
+    a { color: var(--accent); }
+    footer { margin-top: 4rem; color: var(--muted); font-size: 0.85rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>SynapCores Community Edition</h1>
+    <p class="lede">AI-native database. Open core. Self-hosted. Free.</p>
+
+    <h2>Install on Linux or macOS</h2>
+    <pre><code>curl -fsSL https://get.synapcores.com/install.sh | sh</code></pre>
+
+    <p>That detects your platform, downloads the latest signed release tarball
+       from <a href="https://github.com/mataluis2k/aidb/releases">GitHub Releases</a>,
+       verifies its SHA-256, and hands off to the local installer that creates
+       the <code>synapcores</code> system user, lays out
+       <code>/opt/synapcores</code>, and installs a hardened systemd unit.</p>
+
+    <h2>Install the binary only (no system setup)</h2>
+    <pre><code>curl -fsSL https://get.synapcores.com/install.sh | SYNAPCORES_BINARY_ONLY=1 sh</code></pre>
+
+    <h2>Pin a specific release</h2>
+    <pre><code>curl -fsSL https://get.synapcores.com/install.sh | SYNAPCORES_VERSION=v1.0.0-ce sh</code></pre>
+
+    <h2>What you get</h2>
+    <ul>
+      <li>Single-tenant AI-native database with SQL, vector, graph, and
+          AutoML in one engine</li>
+      <li>120 ready-to-run public recipes seeded on first boot</li>
+      <li>One generated random admin password printed once at first boot</li>
+      <li>REST + WebSocket API at <code>:8080</code> (and <code>:8443</code> with TLS)</li>
+    </ul>
+
+    <h2>Documentation</h2>
+    <p>
+      <a href="https://docs.synapcores.com">docs.synapcores.com</a>
+      &middot;
+      <a href="https://github.com/mataluis2k/aidb">GitHub</a>
+      &middot;
+      <a href="https://github.com/mataluis2k/aidb/releases">Releases</a>
+    </p>
+
+    <footer>
+      Need Enterprise (clustering, CDC, SSO, encryption-at-rest, multi-tenancy)?
+      <a href="mailto:sales@synapcores.com">sales@synapcores.com</a>.
+    </footer>
+  </main>
+</body>
+</html>
