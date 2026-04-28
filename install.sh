@@ -114,8 +114,11 @@ log "Platform: $PLATFORM"
 
 if [[ -z "$PINNED_VERSION" ]]; then
     log "Resolving latest release..."
+    # IMPORTANT: no -L here. With -L, curl follows the redirect and
+    # %{redirect_url} comes back empty. We need GitHub's 302 Location
+    # header (which points at /tag/<version>) to extract the tag.
     PINNED_VERSION="$(
-        curl -fsSL -o /dev/null -w '%{redirect_url}' "${RELEASE_BASE}/latest" \
+        curl -fsS -o /dev/null -w '%{redirect_url}' "${RELEASE_BASE}/latest" \
             | sed 's@^.*/tag/@@'
     )"
     [[ -n "$PINNED_VERSION" ]] || fail "could not resolve latest release"
