@@ -84,13 +84,28 @@ detect_platform() {
 
 [get-synapcores] macOS native binaries aren't shipped in this release.
 
-CE on macOS is supported via Docker. Run the official image:
+Two well-supported options run CE on macOS today:
 
-  docker run -p 8080:8080 -v synapcores-data:/var/lib/synapcores \
-             ghcr.io/synapcores/community:latest
+  1. Multipass (lightweight Ubuntu VM, recommended):
+
+       brew install --cask multipass
+       multipass launch 22.04 --name synapcores --memory 8G --cpus 4 --disk 20G
+       multipass shell synapcores
+       # then inside the VM:
+       curl -fsSL https://get.synapcores.com/install.sh | sh
+
+  2. Docker (if you already have Docker Desktop):
+
+       docker run -p 8080:8080 -v synapcores-data:/var/lib/synapcores \
+                  -e AIDB_JWT_SECRET="$(openssl rand -base64 32)" \
+                  ghcr.io/synapcores/community:latest
+
+Full walkthrough including port forwarding and admin-password capture:
+
+  https://docs.synapcores.com/macos/
 
 Native macOS binaries will return in v1.1 once aidb-multimedia migrates
-to the FFmpeg 5+ API. Track progress at https://github.com/SynapCores.
+to the FFmpeg 5+ API.
 
 MAC_EOF
             exit 1
