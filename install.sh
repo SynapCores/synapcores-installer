@@ -73,8 +73,27 @@ detect_platform() {
 
     case "$os" in
         Linux)   os="linux" ;;
-        Darwin)  os="darwin" ;;
-        *)       fail "unsupported OS: $os (CE supports Linux and macOS)" ;;
+        Darwin)
+            cat >&2 <<'MAC_EOF'
+
+[get-synapcores] macOS native binaries aren't shipped in this release.
+
+CE on macOS is supported via Docker. Run the official image:
+
+  docker run -p 8080:8080 -v synapcores-data:/var/lib/synapcores \
+             ghcr.io/synapcores/community:latest
+
+Or build the binary from source if you have FFmpeg < 5 installed:
+
+  git clone <source-repo> && cargo build --release -p aidb-gateway
+
+Native macOS binaries will return in v1.1 once aidb-multimedia migrates
+to the FFmpeg 5+ API. Track progress at https://github.com/SynapCores.
+
+MAC_EOF
+            exit 1
+            ;;
+        *)       fail "unsupported OS: $os (CE binaries are published for Linux only)" ;;
     esac
 
     case "$arch" in
