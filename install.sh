@@ -163,8 +163,14 @@ log "Checksum OK."
 log "Extracting..."
 tar -xzf "${TMPDIR}/${TARBALL}" -C "$TMPDIR"
 
-BINARY_SRC="${TMPDIR}/synapcores"
-[[ -x "$BINARY_SRC" ]] || fail "extracted archive does not contain 'synapcores' binary"
+# The workflow packages the binary inside a single top-level dir:
+#   synapcores-ce-<VERSION>-<PLATFORM>/synapcores
+# Locate it without hardcoding the dir name so the script keeps
+# working if the packaging convention changes.
+BINARY_SRC="$(find "$TMPDIR" -maxdepth 3 -type f -name synapcores -perm -u+x | head -1)"
+if [[ -z "$BINARY_SRC" || ! -x "$BINARY_SRC" ]]; then
+    fail "extracted archive does not contain a 'synapcores' executable"
+fi
 
 # ---------------------------------------------------------------------
 # Install binary
