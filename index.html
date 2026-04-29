@@ -1,90 +1,254 @@
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>SynapCores — Community Edition installer</title>
-  <meta name="description" content="One-line installer for SynapCores Community Edition.">
-  <style>
-    :root {
-      color-scheme: light dark;
-      --bg: #0f1419;
-      --fg: #e6e1cf;
-      --muted: #5c6773;
-      --accent: #59c2ff;
-      --code-bg: #1f2430;
-    }
-    @media (prefers-color-scheme: light) {
-      :root { --bg: #fafafa; --fg: #1f2329; --muted: #6b7785; --code-bg: #eef0f3; }
-    }
-    body {
-      margin: 0;
-      padding: 4rem 1.5rem;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
-      background: var(--bg);
-      color: var(--fg);
-      line-height: 1.6;
-    }
-    main { max-width: 720px; margin: 0 auto; }
-    h1 { font-size: 2rem; margin: 0 0 0.5rem; letter-spacing: -0.02em; }
-    h2 { font-size: 1.1rem; margin: 2.5rem 0 0.5rem; color: var(--accent); }
-    p, li { color: var(--fg); }
-    .lede { color: var(--muted); margin: 0 0 2rem; }
-    pre {
-      background: var(--code-bg);
-      padding: 1rem 1.25rem;
-      border-radius: 8px;
-      overflow-x: auto;
-      font-size: 0.95rem;
-    }
-    code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-    p code { background: var(--code-bg); padding: 0.1em 0.4em; border-radius: 4px; font-size: 0.92em; }
-    a { color: var(--accent); }
-    footer { margin-top: 4rem; color: var(--muted); font-size: 0.85rem; }
-  </style>
-</head>
-<body>
-  <main>
-    <h1>SynapCores Community Edition</h1>
-    <p class="lede">AI-native database. Open core. Self-hosted. Free.</p>
+#!/bin/sh
+#
+# get-synapcores-ce.sh — one-line remote installer for SynapCores
+# Community Edition.
+#
+# Hosted at: https://get.synapcores.com
+#
+# Usage:
+#   curl -fsSL https://get.synapcores.com/install.sh | sh
+#
+# Or, to pin a specific release:
+#   curl -fsSL https://get.synapcores.com/install.sh | SYNAPCORES_VERSION=v1.2.0 sh
+#
+# Written in POSIX sh on purpose: when invoked via `curl ... | sh`,
+# Debian/Ubuntu's /bin/sh is dash, not bash. Bash-only constructs like
+# `[[ ... ]]`, `set -o pipefail`, `local`, `$EUID`, and arrays MUST NOT
+# appear in this file. If you need them, branch out into a helper that
+# bash can run after the binary is on disk.
+#
+# What it does:
+#   1. Detects the OS and architecture
+#   2. Resolves the latest GitHub release tag (or honors $SYNAPCORES_VERSION)
+#   3. Downloads the matching binary tarball + checksum
+#   4. Verifies the checksum
+#   5. Drops the binary at /usr/local/bin/synapcores (or asks if non-root)
+#   6. Hands off to install-ce.sh for system setup (user, paths,
+#      systemd unit, default config), unless SYNAPCORES_BINARY_ONLY is set
+#
+# Requirements:
+#   - curl
+#   - tar
+#   - sha256sum (or shasum -a 256)
 
-    <h2>Install on Linux or macOS</h2>
-    <pre><code>curl -fsSL https://get.synapcores.com/install.sh | sh</code></pre>
+set -eu
 
-    <p>That detects your platform, downloads the latest signed release tarball
-       from <a href="https://github.com/SynapCores/synapcores-releases/releases">GitHub Releases</a>,
-       verifies its SHA-256, and hands off to the local installer that creates
-       the <code>synapcores</code> system user, lays out
-       <code>/opt/synapcores</code>, and installs a hardened systemd unit.</p>
+# ---------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------
 
-    <h2>Install the binary only (no system setup)</h2>
-    <pre><code>curl -fsSL https://get.synapcores.com/install.sh | SYNAPCORES_BINARY_ONLY=1 sh</code></pre>
+GITHUB_REPO="${SYNAPCORES_REPO:-SynapCores/synapcores-releases}"
+RELEASE_BASE="https://github.com/${GITHUB_REPO}/releases"
+PINNED_VERSION="${SYNAPCORES_VERSION:-}"
+INSTALL_PREFIX="${SYNAPCORES_PREFIX:-/usr/local/bin}"
+BINARY_ONLY="${SYNAPCORES_BINARY_ONLY:-}"
 
-    <h2>Pin a specific release</h2>
-    <pre><code>curl -fsSL https://get.synapcores.com/install.sh | SYNAPCORES_VERSION=v1.0.0-ce sh</code></pre>
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
 
-    <h2>What you get</h2>
-    <ul>
-      <li>Single-tenant AI-native database with SQL, vector, graph, and
-          AutoML in one engine</li>
-      <li>120 ready-to-run public recipes seeded on first boot</li>
-      <li>One generated random admin password printed once at first boot</li>
-      <li>REST + WebSocket API at <code>:8080</code> (and <code>:8443</code> with TLS)</li>
-    </ul>
+log()   { printf '\033[1;34m[get-synapcores]\033[0m %s\n' "$*"; }
+warn()  { printf '\033[1;33m[get-synapcores]\033[0m %s\n' "$*" >&2; }
+fail()  { printf '\033[1;31m[get-synapcores]\033[0m %s\n' "$*" >&2; exit 1; }
 
-    <h2>Documentation</h2>
-    <p>
-      <a href="https://docs.synapcores.com">docs.synapcores.com</a>
-      &middot;
-      <a href="https://github.com/SynapCores/synapcores-releases/releases">Releases</a>
-      &middot;
-      <a href="https://synapcores.com">synapcores.com</a>
-    </p>
+require() {
+    command -v "$1" >/dev/null 2>&1 || fail "missing required tool: $1"
+}
 
-    <footer>
-      Need Enterprise (clustering, CDC, SSO, encryption-at-rest, multi-tenancy)?
-      <a href="mailto:sales@synapcores.com">sales@synapcores.com</a>.
-    </footer>
-  </main>
-</body>
-</html>
+require curl
+require tar
+
+if command -v sha256sum >/dev/null 2>&1; then
+    SHA256_TOOL="sha256sum"
+elif command -v shasum >/dev/null 2>&1; then
+    SHA256_TOOL="shasum -a 256"
+else
+    fail "missing required tool: sha256sum (or shasum)"
+fi
+
+# ---------------------------------------------------------------------
+# Platform detection
+# ---------------------------------------------------------------------
+
+# detect_platform: prints "<os>-<arch>" to stdout. Exits non-zero if
+# the platform is unsupported. POSIX sh has no `local`, so we use
+# uppercase variable names to make it obvious these survive the call.
+detect_platform() {
+    DETECTED_OS=$(uname -s)
+    DETECTED_ARCH=$(uname -m)
+
+    case "$DETECTED_OS" in
+        Linux)   DETECTED_OS=linux ;;
+        Darwin)
+            cat >&2 <<'MAC_EOF'
+
+[get-synapcores] macOS native binaries aren't shipped in this release.
+
+Two well-supported options run CE on macOS today:
+
+  1. Multipass (lightweight Ubuntu VM, recommended):
+
+       brew install --cask multipass
+       multipass launch 22.04 --name synapcores --memory 8G --cpus 4 --disk 20G
+       multipass shell synapcores
+       # then inside the VM:
+       curl -fsSL https://get.synapcores.com/install.sh | sh
+
+  2. Docker (if you already have Docker Desktop):
+
+       docker run -p 8080:8080 -v synapcores-data:/var/lib/synapcores \
+                  -e AIDB_JWT_SECRET="$(openssl rand -base64 32)" \
+                  ghcr.io/synapcores/community:latest
+
+Full walkthrough including port forwarding and admin-password capture:
+
+  https://docs.synapcores.com/macos/
+
+Native macOS binaries will return in v1.1 once aidb-multimedia migrates
+to the FFmpeg 5+ API.
+
+MAC_EOF
+            exit 1
+            ;;
+        *)       fail "unsupported OS: $DETECTED_OS (CE binaries are published for Linux only)" ;;
+    esac
+
+    case "$DETECTED_ARCH" in
+        x86_64|amd64)   DETECTED_ARCH=x86_64 ;;
+        aarch64|arm64)  DETECTED_ARCH=aarch64 ;;
+        *)              fail "unsupported architecture: $DETECTED_ARCH" ;;
+    esac
+
+    printf '%s-%s\n' "$DETECTED_OS" "$DETECTED_ARCH"
+}
+
+PLATFORM=$(detect_platform)
+log "Platform: $PLATFORM"
+
+# ---------------------------------------------------------------------
+# Resolve version
+# ---------------------------------------------------------------------
+
+if [ -z "$PINNED_VERSION" ]; then
+    log "Resolving latest release..."
+    # IMPORTANT: no -L. With -L, curl follows the redirect and
+    # %{redirect_url} comes back empty. We need GitHub's 302 Location
+    # header (which points at /tag/<version>) to extract the tag.
+    PINNED_VERSION=$(
+        curl -fsS -o /dev/null -w '%{redirect_url}' "${RELEASE_BASE}/latest" \
+            | sed 's@^.*/tag/@@'
+    )
+    [ -n "$PINNED_VERSION" ] || fail "could not resolve latest release"
+fi
+log "Version: $PINNED_VERSION"
+
+# ---------------------------------------------------------------------
+# Download
+# ---------------------------------------------------------------------
+
+TARBALL="synapcores-ce-${PINNED_VERSION}-${PLATFORM}.tar.gz"
+TARBALL_URL="${RELEASE_BASE}/download/${PINNED_VERSION}/${TARBALL}"
+CHECKSUM_URL="${TARBALL_URL}.sha256"
+
+WORK_DIR=$(mktemp -d)
+trap 'rm -rf "$WORK_DIR"' EXIT INT TERM
+
+log "Downloading ${TARBALL}..."
+curl -fsSL "$TARBALL_URL" -o "${WORK_DIR}/${TARBALL}" \
+    || fail "download failed: $TARBALL_URL"
+
+log "Downloading checksum..."
+curl -fsSL "$CHECKSUM_URL" -o "${WORK_DIR}/${TARBALL}.sha256" \
+    || fail "checksum download failed: $CHECKSUM_URL"
+
+# ---------------------------------------------------------------------
+# Verify
+# ---------------------------------------------------------------------
+
+log "Verifying checksum..."
+(
+    cd "$WORK_DIR"
+    EXPECTED=$(awk '{print $1}' "${TARBALL}.sha256")
+    ACTUAL=$($SHA256_TOOL "${TARBALL}" | awk '{print $1}')
+    if [ "$EXPECTED" != "$ACTUAL" ]; then
+        fail "checksum mismatch: expected $EXPECTED got $ACTUAL"
+    fi
+)
+log "Checksum OK."
+
+# ---------------------------------------------------------------------
+# Extract
+# ---------------------------------------------------------------------
+
+log "Extracting..."
+tar -xzf "${WORK_DIR}/${TARBALL}" -C "$WORK_DIR"
+
+# The workflow packages the binary inside a single top-level dir:
+#   synapcores-ce-<VERSION>-<PLATFORM>/synapcores
+# Locate it without hardcoding the dir name so the script keeps
+# working if the packaging convention changes.
+BINARY_SRC=$(find "$WORK_DIR" -maxdepth 3 -type f -name synapcores -perm -u+x 2>/dev/null | head -1)
+if [ -z "$BINARY_SRC" ] || [ ! -x "$BINARY_SRC" ]; then
+    fail "extracted archive does not contain a 'synapcores' executable"
+fi
+
+# ---------------------------------------------------------------------
+# Install binary
+# ---------------------------------------------------------------------
+
+# POSIX sh has no $EUID — use `id -u`. Also POSIX has no arrays, so we
+# use SUDO_PREFIX as a (possibly empty) string that is word-split into
+# argv when the install command runs.
+if [ "$(id -u)" -eq 0 ]; then
+    SUDO_PREFIX=""
+else
+    log "Installing to ${INSTALL_PREFIX} requires sudo..."
+    SUDO_PREFIX="sudo"
+fi
+
+# shellcheck disable=SC2086
+$SUDO_PREFIX install -m 0755 "$BINARY_SRC" "${INSTALL_PREFIX}/synapcores" \
+    || fail "binary install failed"
+log "Installed: ${INSTALL_PREFIX}/synapcores"
+
+# ---------------------------------------------------------------------
+# Verify install
+# ---------------------------------------------------------------------
+
+if "${INSTALL_PREFIX}/synapcores" --version 2>/dev/null | grep -q "Community"; then
+    log "Edition check: $("${INSTALL_PREFIX}/synapcores" --version)"
+else
+    warn "binary installed but did not report 'Community' on --version"
+fi
+
+# ---------------------------------------------------------------------
+# System setup (or skip)
+# ---------------------------------------------------------------------
+
+if [ -n "$BINARY_ONLY" ]; then
+    log "SYNAPCORES_BINARY_ONLY set; skipping system setup."
+    log "To finish setup later: sudo ${INSTALL_PREFIX}/synapcores-installer"
+    exit 0
+fi
+
+# Fetch the system installer from the same release. install-ce.sh is
+# allowed to use bash — it's saved to disk first, so its shebang is
+# honored. Only THIS bootstrap has to be POSIX-clean.
+INSTALLER_URL="${RELEASE_BASE}/download/${PINNED_VERSION}/install-ce.sh"
+INSTALLER="${WORK_DIR}/install-ce.sh"
+
+log "Fetching system installer..."
+if curl -fsSL "$INSTALLER_URL" -o "$INSTALLER" 2>/dev/null; then
+    chmod +x "$INSTALLER"
+    if [ "$(id -u)" -eq 0 ]; then
+        "$INSTALLER" --binary "${INSTALL_PREFIX}/synapcores"
+    else
+        log "System setup requires sudo..."
+        sudo "$INSTALLER" --binary "${INSTALL_PREFIX}/synapcores"
+    fi
+else
+    warn "system installer not found at $INSTALLER_URL"
+    warn "binary is installed; complete setup manually per the docs"
+fi
+
+log "Done. Try: synapcores --version"
