@@ -122,8 +122,115 @@ MAC_EOF
     printf '%s-%s\n' "$DETECTED_OS" "$DETECTED_ARCH"
 }
 
+# check_distro: verify the host runs a supported Linux distribution
+# BEFORE downloading 50 MB of binary that won't link.
+#
+# The CE binary is dynamically linked against FFmpeg 4 (libavutil.so.56),
+# Tesseract 4, Leptonica, glibc 2.35+. The supported set is currently
+# Ubuntu 22.04 / Debian 12. Newer distros (Ubuntu 24.04 / Debian 13) ship
+# FFmpeg 6 with a different SONAME and the binary will not link.
+#
+# https://docs.synapcores.com/requirements/#supported-linux-distributions
+check_distro() {
+    if [ ! -f /etc/os-release ]; then
+        warn "no /etc/os-release found; cannot verify distro compatibility"
+        warn "if the install fails with 'libavutil.so.56 not found', see"
+        warn "  https://docs.synapcores.com/requirements/"
+        return 0
+    fi
+    # shellcheck disable=SC1091
+    . /etc/os-release
+
+    case "${ID:-unknown}:${VERSION_ID:-?}" in
+        ubuntu:22.04|debian:12)
+            log "Distro: ${PRETTY_NAME:-$ID $VERSION_ID} — supported."
+            ;;
+        ubuntu:20.04|ubuntu:18.04|debian:11|debian:10)
+            cat >&2 <<DISTRO_OLD_EOF
+
+[get-synapcores] ${PRETTY_NAME:-$ID $VERSION_ID} is too old.
+
+The CE binary requires glibc 2.35 (Ubuntu 22.04 / Debian 12 baseline).
+Your system has glibc < 2.35 and the binary will not link.
+
+Options:
+  1. Upgrade to Ubuntu 22.04 LTS or Debian 12.
+  2. Run via Docker (works on any Linux):
+       docker run -p 8080:8080 -v synapcores-data:/var/lib/synapcores \\
+                  -e AIDB_JWT_SECRET="\$(openssl rand -base64 32)" \\
+                  ghcr.io/synapcores/community:latest
+
+Full distro matrix: https://docs.synapcores.com/requirements/#supported-linux-distributions
+
+DISTRO_OLD_EOF
+            exit 1
+            ;;
+        ubuntu:24.04|ubuntu:24.10|ubuntu:25.04|debian:13|debian:14)
+            cat >&2 <<DISTRO_NEW_EOF
+
+[get-synapcores] ${PRETTY_NAME:-$ID $VERSION_ID} is not yet supported.
+
+This distro ships FFmpeg 6 (libavutil.so.58); the CE binary is built
+against FFmpeg 4 (libavutil.so.56). The binary will fail to link.
+
+Workarounds:
+  1. Run via Docker (works on any Linux):
+       docker run -p 8080:8080 -v synapcores-data:/var/lib/synapcores \\
+                  -e AIDB_JWT_SECRET="\$(openssl rand -base64 32)" \\
+                  ghcr.io/synapcores/community:latest
+
+  2. Use Ubuntu 22.04 / Debian 12 in a VM or container.
+
+  3. Wait for v1.2.1-ce — multi-distro builds are tracked.
+
+Full distro matrix: https://docs.synapcores.com/requirements/#supported-linux-distributions
+
+DISTRO_NEW_EOF
+            exit 1
+            ;;
+        rhel:9*|rocky:9*|almalinux:9*|amzn:2023)
+            warn "${PRETTY_NAME:-$ID $VERSION_ID}: untested but may work."
+            warn "If the install fails on missing libraries, install:"
+            warn "  sudo dnf install -y epel-release"
+            warn "  sudo dnf install -y ffmpeg-libs tesseract leptonica freetype fontconfig"
+            warn "Please report success/failure: https://github.com/SynapCores/synapcores-releases/issues"
+            ;;
+        rhel:8*|rocky:8*|almalinux:8*|centos:7*|amzn:2)
+            cat >&2 <<DISTRO_RHEL_OLD_EOF
+
+[get-synapcores] ${PRETTY_NAME:-$ID $VERSION_ID} has glibc < 2.35.
+
+The CE binary will not link. Use Docker or upgrade to RHEL 9 / Rocky 9 /
+Alma 9 / Amazon Linux 2023.
+
+DISTRO_RHEL_OLD_EOF
+            exit 1
+            ;;
+        alpine:*)
+            cat >&2 <<ALPINE_EOF
+
+[get-synapcores] Alpine Linux uses musl libc; the CE binary requires glibc.
+
+Use the Docker image (which is glibc-based) instead:
+  docker run -p 8080:8080 -v synapcores-data:/var/lib/synapcores \\
+             -e AIDB_JWT_SECRET="\$(openssl rand -base64 32)" \\
+             ghcr.io/synapcores/community:latest
+
+ALPINE_EOF
+            exit 1
+            ;;
+        *)
+            warn "Distro: ${PRETTY_NAME:-$ID $VERSION_ID} — not in the verified support matrix."
+            warn "Continuing anyway. If the binary fails to link, see:"
+            warn "  https://docs.synapcores.com/requirements/"
+            ;;
+    esac
+}
+
 PLATFORM=$(detect_platform)
 log "Platform: $PLATFORM"
+
+check_distro
 
 # ---------------------------------------------------------------------
 # Resolve version
