@@ -338,11 +338,20 @@ log "Installed: ${INSTALL_PREFIX}/synapcores"
 # ---------------------------------------------------------------------
 # Verify install
 # ---------------------------------------------------------------------
+#
+# On macOS the binary won't run yet because Homebrew's ffmpeg /
+# tesseract / leptonica aren't necessarily installed — the dynamic
+# linker would fail to find libavformat.dylib etc., and `--version`
+# silently exits with no output. Skip the edition check on darwin and
+# rely on the post-install instructions to walk the user through the
+# Homebrew deps.
 
-if "${INSTALL_PREFIX}/synapcores" --version 2>/dev/null | grep -q "Community"; then
-    log "Edition check: $("${INSTALL_PREFIX}/synapcores" --version)"
-else
-    warn "binary installed but did not report 'Community' on --version"
+if [ "$DETECTED_OS" = "linux" ]; then
+    if "${INSTALL_PREFIX}/synapcores" --version 2>/dev/null | grep -q "Community"; then
+        log "Edition check: $("${INSTALL_PREFIX}/synapcores" --version)"
+    else
+        warn "binary installed but did not report 'Community' on --version"
+    fi
 fi
 
 # ---------------------------------------------------------------------
@@ -351,13 +360,51 @@ fi
 
 if [ -n "$BINARY_ONLY" ]; then
     log "SYNAPCORES_BINARY_ONLY set; skipping system setup."
-    log "To finish setup later: sudo ${INSTALL_PREFIX}/synapcores-installer"
     exit 0
 fi
 
-# Fetch the system installer from the same release. install-ce.sh is
-# allowed to use bash — it's saved to disk first, so its shebang is
-# honored. Only THIS bootstrap has to be POSIX-clean.
+# macOS path: print Homebrew + manual-start instructions and exit.
+# install-ce.sh is a Linux installer (uses useradd, apt-get, systemd)
+# and would fail with "useradd: command not found" on macOS.
+if [ "$DETECTED_OS" = "darwin" ]; then
+    cat <<MAC_EOF
+
+[get-synapcores] macOS post-install steps
+
+The binary is installed at ${INSTALL_PREFIX}/synapcores. Two more steps
+to get it running:
+
+1. Install runtime dependencies via Homebrew:
+
+     brew install ffmpeg@7 tesseract leptonica
+
+   (If ffmpeg@7 is unavailable in your Homebrew tap, fall back to
+   plain \`brew install ffmpeg\` — the binary supports both.)
+
+2. Set a JWT secret and start the service:
+
+     export AIDB_JWT_SECRET="\$(openssl rand -base64 32)"
+     ${INSTALL_PREFIX}/synapcores --config <path-to-config.toml>
+
+   For a default config template, see:
+     https://docs.synapcores.com/macos/
+
+3. (Optional) Run as a launchd service so it survives reboots:
+
+     https://docs.synapcores.com/macos/#launchd-setup
+
+4. Capture the first-boot admin password from the log output.
+   Open the Web UI at http://localhost:8080/ and change it under
+   Settings → Account.
+
+MAC_EOF
+    exit 0
+fi
+
+# Linux path: fetch and run install-ce.sh (creates synapcores user,
+# /opt/synapcores layout, systemd unit). install-ce.sh is allowed to
+# use bash — it's saved to disk first, so its shebang is honored. Only
+# THIS bootstrap has to be POSIX-clean.
 INSTALLER_URL="${RELEASE_BASE}/download/${PINNED_VERSION}/install-ce.sh"
 INSTALLER="${WORK_DIR}/install-ce.sh"
 
