@@ -79,38 +79,8 @@ detect_platform() {
 
     case "$DETECTED_OS" in
         Linux)   DETECTED_OS=linux ;;
-        Darwin)
-            cat >&2 <<'MAC_EOF'
-
-[get-synapcores] macOS native binaries aren't shipped in this release.
-
-Two well-supported options run CE on macOS today:
-
-  1. Multipass (lightweight Ubuntu VM, recommended):
-
-       brew install --cask multipass
-       multipass launch 22.04 --name synapcores --memory 8G --cpus 4 --disk 20G
-       multipass shell synapcores
-       # then inside the VM:
-       curl -fsSL https://get.synapcores.com/install.sh | sh
-
-  2. Docker (if you already have Docker Desktop):
-
-       docker run -p 8080:8080 -v synapcores-data:/var/lib/synapcores \
-                  -e AIDB_JWT_SECRET="$(openssl rand -base64 32)" \
-                  ghcr.io/synapcores/community:latest
-
-Full walkthrough including port forwarding and admin-password capture:
-
-  https://docs.synapcores.com/macos/
-
-Native macOS binaries will return in v1.1 once aidb-multimedia migrates
-to the FFmpeg 5+ API.
-
-MAC_EOF
-            exit 1
-            ;;
-        *)       fail "unsupported OS: $DETECTED_OS (CE binaries are published for Linux only)" ;;
+        Darwin)  DETECTED_OS=darwin ;;
+        *)       fail "unsupported OS: $DETECTED_OS (CE binaries are published for Linux and macOS)" ;;
     esac
 
     case "$DETECTED_ARCH" in
@@ -119,22 +89,55 @@ MAC_EOF
         *)              fail "unsupported architecture: $DETECTED_ARCH" ;;
     esac
 
+    # Intel Mac native binary is not published as of v1.3.0-ce. The
+    # source migration to ffmpeg-next 7 unblocked the build, but
+    # GitHub-hosted macos-13 runner availability has been unreliable
+    # on personal-account repos (multi-hour queue waits with no
+    # allocation). Apple Silicon (macos-14) builds reliably, so we
+    # ship Apple Silicon native + recommend Docker for Intel Macs.
+    if [ "$DETECTED_OS" = "darwin" ] && [ "$DETECTED_ARCH" = "x86_64" ]; then
+        cat >&2 <<INTEL_MAC_EOF
+
+[get-synapcores] Intel Mac (x86_64) native binaries are not currently
+published. Apple Silicon (M1/M2/M3/M4) Macs have a native binary
+available, but Intel Mac users should run via Docker:
+
+  docker run -p 8080:8080 -v synapcores-data:/var/lib/synapcores \\
+             -e AIDB_JWT_SECRET="\$(openssl rand -base64 32)" \\
+             ghcr.io/synapcores/community:latest
+
+Apple discontinued Intel Macs in 2023 and the GitHub-hosted macos-13
+runner pool is too small to reliably allocate. Native Intel Mac
+binaries may return in a future release if runner availability
+improves.
+
+Full platform matrix: https://docs.synapcores.com/requirements/
+
+INTEL_MAC_EOF
+        exit 1
+    fi
+
     printf '%s-%s\n' "$DETECTED_OS" "$DETECTED_ARCH"
 }
 
 # check_distro: verify the host runs a supported Linux distribution
-# BEFORE downloading 50 MB of binary that won't link.
+# BEFORE downloading 50 MB of binary that won't link, AND select the
+# correct tarball variant via DISTRO_TAG.
 #
-# The CE binary is dynamically linked against FFmpeg 4 (libavutil.so.56),
-# Tesseract 4, Leptonica, glibc 2.35+. The supported set is currently
-# Ubuntu 22.04 / Debian 12. Newer distros (Ubuntu 24.04 / Debian 13) ship
-# FFmpeg 6 with a different SONAME and the binary will not link.
+# Two Linux tarball variants are published per architecture:
+#   - linux-{x86_64,aarch64}          built on Ubuntu 22.04 (FFmpeg 4 SONAMEs)
+#   - linux-{x86_64,aarch64}-ubuntu24 built on Ubuntu 24.04 (FFmpeg 6 SONAMEs)
+#
+# DISTRO_TAG is "" for the 22.04 variant and "-ubuntu24" for the 24.04
+# variant. macOS sets DISTRO_TAG="" — the platform string already carries
+# the OS distinction (darwin-x86_64, darwin-aarch64).
 #
 # https://docs.synapcores.com/requirements/#supported-linux-distributions
 check_distro() {
+    DISTRO_TAG=""
     if [ ! -f /etc/os-release ]; then
         warn "no /etc/os-release found; cannot verify distro compatibility"
-        warn "if the install fails with 'libavutil.so.56 not found', see"
+        warn "if the install fails with a missing libavutil, see"
         warn "  https://docs.synapcores.com/requirements/"
         return 0
     fi
@@ -143,7 +146,12 @@ check_distro() {
 
     case "${ID:-unknown}:${VERSION_ID:-?}" in
         ubuntu:22.04|debian:12)
-            log "Distro: ${PRETTY_NAME:-$ID $VERSION_ID} — supported."
+            log "Distro: ${PRETTY_NAME:-$ID $VERSION_ID} — supported (FFmpeg 4 build)."
+            DISTRO_TAG=""
+            ;;
+        ubuntu:24.04|debian:13)
+            log "Distro: ${PRETTY_NAME:-$ID $VERSION_ID} — supported (FFmpeg 6 build)."
+            DISTRO_TAG="-ubuntu24"
             ;;
         ubuntu:20.04|ubuntu:18.04|debian:11|debian:10)
             cat >&2 <<DISTRO_OLD_EOF
@@ -165,13 +173,15 @@ Full distro matrix: https://docs.synapcores.com/requirements/#supported-linux-di
 DISTRO_OLD_EOF
             exit 1
             ;;
-        ubuntu:24.04|ubuntu:24.10|ubuntu:25.04|debian:13|debian:14)
+        ubuntu:24.10|ubuntu:25.04|debian:14)
             cat >&2 <<DISTRO_NEW_EOF
 
-[get-synapcores] ${PRETTY_NAME:-$ID $VERSION_ID} is not yet supported.
+[get-synapcores] ${PRETTY_NAME:-$ID $VERSION_ID} is not yet in the verified support matrix.
 
-This distro ships FFmpeg 6 (libavutil.so.58); the CE binary is built
-against FFmpeg 4 (libavutil.so.56). The binary will fail to link.
+The CE matrix currently ships binaries for:
+  - Ubuntu 22.04 / Debian 12 (FFmpeg 4)
+  - Ubuntu 24.04 / Debian 13 (FFmpeg 6)
+  - macOS 13+ (Intel + Apple Silicon)
 
 Workarounds:
   1. Run via Docker (works on any Linux):
@@ -179,9 +189,7 @@ Workarounds:
                   -e AIDB_JWT_SECRET="\$(openssl rand -base64 32)" \\
                   ghcr.io/synapcores/community:latest
 
-  2. Use Ubuntu 22.04 / Debian 12 in a VM or container.
-
-  3. Wait for v1.2.1-ce — multi-distro builds are tracked.
+  2. Use a supported distro in a VM or container.
 
 Full distro matrix: https://docs.synapcores.com/requirements/#supported-linux-distributions
 
@@ -221,7 +229,7 @@ ALPINE_EOF
             ;;
         *)
             warn "Distro: ${PRETTY_NAME:-$ID $VERSION_ID} — not in the verified support matrix."
-            warn "Continuing anyway. If the binary fails to link, see:"
+            warn "Continuing anyway with the FFmpeg 4 build. If the binary fails to link, see:"
             warn "  https://docs.synapcores.com/requirements/"
             ;;
     esac
@@ -230,7 +238,13 @@ ALPINE_EOF
 PLATFORM=$(detect_platform)
 log "Platform: $PLATFORM"
 
-check_distro
+# DISTRO_TAG is meaningful only for Linux. macOS skips check_distro.
+DISTRO_TAG=""
+case "$PLATFORM" in
+    linux-*)
+        check_distro
+        ;;
+esac
 
 # ---------------------------------------------------------------------
 # Resolve version
@@ -253,7 +267,10 @@ log "Version: $PINNED_VERSION"
 # Download
 # ---------------------------------------------------------------------
 
-TARBALL="synapcores-ce-${PINNED_VERSION}-${PLATFORM}.tar.gz"
+# DISTRO_TAG is "" on Ubuntu 22.04 / Debian 12 / macOS / unknown distros
+# (FFmpeg 4 / native Mac tarball) and "-ubuntu24" on Ubuntu 24.04 / Debian 13
+# (FFmpeg 6 tarball variant). Set by check_distro() above.
+TARBALL="synapcores-ce-${PINNED_VERSION}-${PLATFORM}${DISTRO_TAG}.tar.gz"
 TARBALL_URL="${RELEASE_BASE}/download/${PINNED_VERSION}/${TARBALL}"
 CHECKSUM_URL="${TARBALL_URL}.sha256"
 
