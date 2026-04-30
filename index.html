@@ -363,41 +363,109 @@ if [ -n "$BINARY_ONLY" ]; then
     exit 0
 fi
 
-# macOS path: print Homebrew + manual-start instructions and exit.
-# install-ce.sh is a Linux installer (uses useradd, apt-get, systemd)
-# and would fail with "useradd: command not found" on macOS.
+# macOS path: detect missing Homebrew deps and offer to install them.
+# install-ce.sh is a Linux installer (useradd, apt-get, systemd) and
+# would fail with "useradd: command not found" on macOS — we don't
+# call it here.
+#
+# The CE macOS binary is dynamically linked against Homebrew's
+# ffmpeg, tesseract, and leptonica. Without them the binary's
+# dynamic linker fails silently and `--version` returns nothing.
+#
+# Set SYNAPCORES_NONINTERACTIVE=1 to skip the prompt and install
+# missing deps automatically (CI / automation).
 if [ "$DETECTED_OS" = "darwin" ]; then
-    cat <<MAC_EOF
+    if ! command -v brew >/dev/null 2>&1; then
+        warn "Homebrew is required for macOS runtime deps (ffmpeg/tesseract/leptonica)."
+        warn "Install Homebrew first:  https://brew.sh"
+        warn "Then re-run:  curl -fsSL https://get.synapcores.com/install.sh | sh"
+        exit 1
+    fi
 
-[get-synapcores] macOS post-install steps
+    # Pick the right ffmpeg formula. We try ffmpeg@7 first because
+    # that's what the GitHub Actions release built against; if it's
+    # not in the user's Homebrew tap we fall back to plain ffmpeg
+    # (ffmpeg-next 7 supports both 7.x and 8.x at runtime).
+    if brew info ffmpeg@7 >/dev/null 2>&1; then
+        FFMPEG_FORMULA="ffmpeg@7"
+    else
+        FFMPEG_FORMULA="ffmpeg"
+    fi
+    REQUIRED_DEPS="$FFMPEG_FORMULA tesseract leptonica"
 
-The binary is installed at ${INSTALL_PREFIX}/synapcores. Two more steps
-to get it running:
+    MISSING_DEPS=""
+    for dep in $REQUIRED_DEPS; do
+        if ! brew list --formula "$dep" >/dev/null 2>&1; then
+            MISSING_DEPS="$MISSING_DEPS $dep"
+        fi
+    done
+    # Strip leading whitespace
+    MISSING_DEPS=$(printf '%s' "$MISSING_DEPS" | sed 's/^ *//')
 
-1. Install runtime dependencies via Homebrew:
+    if [ -n "$MISSING_DEPS" ]; then
+        log "Missing Homebrew deps: $MISSING_DEPS"
 
-     brew install ffmpeg@7 tesseract leptonica
+        if [ -n "${SYNAPCORES_NONINTERACTIVE:-}" ]; then
+            log "Non-interactive mode (SYNAPCORES_NONINTERACTIVE set); installing..."
+            ANSWER="y"
+        elif [ ! -t 0 ] && [ ! -e /dev/tty ]; then
+            warn "stdin is not a terminal and /dev/tty is unavailable; cannot prompt."
+            warn "Install manually:  brew install $MISSING_DEPS"
+            warn "Or set SYNAPCORES_NONINTERACTIVE=1 to install automatically."
+            exit 1
+        else
+            printf '\033[1;34m[get-synapcores]\033[0m Install them now? (brew install %s) [Y/n] ' "$MISSING_DEPS"
+            # Read from /dev/tty so the prompt works under
+            # `curl ... | sh` where stdin is the script itself.
+            read -r ANSWER < /dev/tty || ANSWER="n"
+        fi
 
-   (If ffmpeg@7 is unavailable in your Homebrew tap, fall back to
-   plain \`brew install ffmpeg\` — the binary supports both.)
+        case "$ANSWER" in
+            ""|[Yy]*)
+                log "Running: brew install $MISSING_DEPS"
+                # shellcheck disable=SC2086
+                brew install $MISSING_DEPS || {
+                    warn "brew install failed. Install manually:  brew install $MISSING_DEPS"
+                    exit 1
+                }
+                ;;
+            *)
+                log "Skipping. Install manually:  brew install $MISSING_DEPS"
+                log "Then run:  ${INSTALL_PREFIX}/synapcores --version"
+                exit 0
+                ;;
+        esac
+    else
+        log "All Homebrew runtime deps present."
+    fi
 
-2. Set a JWT secret and start the service:
+    # With deps installed, the binary should now run.
+    if "${INSTALL_PREFIX}/synapcores" --version 2>/dev/null | grep -q "Community"; then
+        log "Edition check: $("${INSTALL_PREFIX}/synapcores" --version)"
+    else
+        warn "Binary still won't run cleanly. Diagnose with:"
+        warn "  otool -L ${INSTALL_PREFIX}/synapcores | head -20"
+        warn "Look for any 'not found' lines pointing at missing dylibs."
+    fi
+
+    cat <<MAC_FINISH_EOF
+
+[get-synapcores] Almost done — final manual steps
+
+1. Set a JWT secret and start the gateway:
 
      export AIDB_JWT_SECRET="\$(openssl rand -base64 32)"
-     ${INSTALL_PREFIX}/synapcores --config <path-to-config.toml>
+     ${INSTALL_PREFIX}/synapcores
 
-   For a default config template, see:
-     https://docs.synapcores.com/macos/
+   The first start prints an admin password — capture it from the log.
 
-3. (Optional) Run as a launchd service so it survives reboots:
+2. Open the Web UI:    http://localhost:8080/
+   Log in as admin and change the password under Settings → Account.
 
+3. (Optional) Auto-start at login via launchd:
      https://docs.synapcores.com/macos/#launchd-setup
 
-4. Capture the first-boot admin password from the log output.
-   Open the Web UI at http://localhost:8080/ and change it under
-   Settings → Account.
-
-MAC_EOF
+MAC_FINISH_EOF
     exit 0
 fi
 
