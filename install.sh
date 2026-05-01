@@ -238,6 +238,15 @@ ALPINE_EOF
 PLATFORM=$(detect_platform)
 log "Platform: $PLATFORM"
 
+# Re-derive DETECTED_OS / DETECTED_ARCH in the parent shell. POSIX
+# `$(...)` runs the function in a subshell, so the assignments inside
+# detect_platform() never escape — and `set -eu` aborts the install
+# script the first time it reads `$DETECTED_OS` later (real bug
+# reported on a fresh Debian 12 install of v1.3.1-ce: "sh: 349:
+# DETECTED_OS: parameter not set").
+DETECTED_OS="${PLATFORM%-*}"
+DETECTED_ARCH="${PLATFORM#*-}"
+
 # DISTRO_TAG is meaningful only for Linux. macOS skips check_distro.
 DISTRO_TAG=""
 case "$PLATFORM" in
@@ -448,22 +457,123 @@ if [ "$DETECTED_OS" = "darwin" ]; then
         warn "Look for any 'not found' lines pointing at missing dylibs."
     fi
 
+    # ----- Drop default config + data dir -----
+    SC_HOME="${HOME}/.synapcores"
+    SC_CONFIG="${SC_HOME}/gateway.toml"
+    SC_DATA_DIR="${SC_HOME}/data"
+    SC_MODELS_DIR="${SC_HOME}/models/text"
+
+    mkdir -p "$SC_HOME" "$SC_DATA_DIR" "$SC_MODELS_DIR"
+
+    # The bundled template (v1.3.1+) lives next to the binary in the
+    # extracted tarball. Older tarballs don't have it, so fall through
+    # to the inline minimal config in that case.
+    BUNDLED_TEMPLATE="$(dirname "$BINARY_SRC")/community.toml.template"
+
+    if [ -f "$SC_CONFIG" ]; then
+        log "Config already exists at ${SC_CONFIG} — leaving as-is."
+    elif [ -f "$BUNDLED_TEMPLATE" ]; then
+        # Adapt the template for macOS: rewrite the data_dir to live
+        # under the user's home (the template defaults to
+        # /opt/synapcores/aidb_data, which would need root and isn't
+        # the macOS convention).
+        sed "s|^data_dir = .*|data_dir = \"${SC_DATA_DIR}\"|" \
+            "$BUNDLED_TEMPLATE" \
+            > "$SC_CONFIG"
+        log "Wrote default config to ${SC_CONFIG}"
+    else
+        warn "No config template bundled (older tarball?). Generating minimal config."
+        cat >"$SC_CONFIG" <<MIN_CFG
+[server]
+listen_addr     = "127.0.0.1:8080"
+max_body_size   = 1073741824
+request_timeout = 30
+enable_cors     = true
+data_dir = "${SC_DATA_DIR}"
+
+[auth]
+enabled          = true
+token_expiration = 86400
+
+[query]
+max_concurrent_queries = 32
+default_timeout_ms     = 30000
+
+[query.ai_service]
+provider        = "native"
+model           = "llama-3.2-1b-instruct-q4_k_m"
+embedding_model = "minilm"
+
+[ai_cache]
+enabled              = false
+similarity_threshold = 0.92
+ttl_seconds          = 3600
+max_entries          = 10000
+embedding_dim        = 384
+MIN_CFG
+        log "Wrote minimal config to ${SC_CONFIG}"
+    fi
+
+    # ----- Offer to download the default LLM (GGUF) -----
+    DEFAULT_MODEL_FILE="${SC_MODELS_DIR}/llama-3.2-1b-instruct-q4_k_m.gguf"
+    DEFAULT_MODEL_URL="https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf"
+
+    if [ -f "$DEFAULT_MODEL_FILE" ]; then
+        log "Default LLM already at ${DEFAULT_MODEL_FILE}"
+    elif [ -n "${SYNAPCORES_NO_MODEL_DOWNLOAD:-}" ]; then
+        log "SYNAPCORES_NO_MODEL_DOWNLOAD set; skipping LLM download."
+        log "AI Chat will fall back to whichever provider is enabled in the config."
+    else
+        if [ -n "${SYNAPCORES_NONINTERACTIVE:-}" ]; then
+            log "Non-interactive: downloading default LLM..."
+            DL_ANSWER="y"
+        elif [ ! -t 0 ] && [ ! -e /dev/tty ]; then
+            warn "Cannot prompt for LLM download (no tty). Skipping."
+            warn "Download manually:  curl -L -o ${DEFAULT_MODEL_FILE} ${DEFAULT_MODEL_URL}"
+            DL_ANSWER="n"
+        else
+            printf '\033[1;34m[get-synapcores]\033[0m Download default LLM (Llama 3.2 1B Q4_K_M, ~700MB)? [Y/n] '
+            read -r DL_ANSWER < /dev/tty || DL_ANSWER="n"
+        fi
+
+        case "$DL_ANSWER" in
+            ""|[Yy]*)
+                log "Downloading ${DEFAULT_MODEL_URL}"
+                log "  → ${DEFAULT_MODEL_FILE}"
+                if curl -fL --progress-bar -o "${DEFAULT_MODEL_FILE}.tmp" "$DEFAULT_MODEL_URL"; then
+                    mv "${DEFAULT_MODEL_FILE}.tmp" "$DEFAULT_MODEL_FILE"
+                    log "  ✓ downloaded $(du -h "$DEFAULT_MODEL_FILE" | cut -f1)"
+                else
+                    warn "Download failed. Skip and retry later via:"
+                    warn "  curl -L -o ${DEFAULT_MODEL_FILE} ${DEFAULT_MODEL_URL}"
+                    rm -f "${DEFAULT_MODEL_FILE}.tmp"
+                fi
+                ;;
+            *)
+                log "Skipped. Download manually any time:"
+                log "  curl -L -o ${DEFAULT_MODEL_FILE} ${DEFAULT_MODEL_URL}"
+                log "Or edit ${SC_CONFIG} to change [query.ai_service] provider."
+                ;;
+        esac
+    fi
+
+    # The native provider uses AIDB_MODELS_DIR to locate GGUF files.
+    # Hard-code the path users shouldn't have to discover.
+    SC_MODELS_DIR_ABS="$SC_MODELS_DIR"
+
     cat <<MAC_FINISH_EOF
 
-[get-synapcores] Almost done — final manual steps
+[get-synapcores] Done — start the gateway
 
-1. Set a JWT secret and start the gateway:
+  export AIDB_JWT_SECRET="\$(openssl rand -base64 32)"
+  export AIDB_MODELS_DIR="${SC_MODELS_DIR_ABS}"
+  ${INSTALL_PREFIX}/synapcores --config ${SC_CONFIG}
 
-     export AIDB_JWT_SECRET="\$(openssl rand -base64 32)"
-     ${INSTALL_PREFIX}/synapcores
+The first start prints an admin password — capture it from the log
+output. Then open the Web UI at http://localhost:8080/
 
-   The first start prints an admin password — capture it from the log.
-
-2. Open the Web UI:    http://localhost:8080/
-   Log in as admin and change the password under Settings → Account.
-
-3. (Optional) Auto-start at login via launchd:
-     https://docs.synapcores.com/macos/#launchd-setup
+(Optional) auto-start via launchd:
+  https://docs.synapcores.com/macos/#launchd-setup
 
 MAC_FINISH_EOF
     exit 0
