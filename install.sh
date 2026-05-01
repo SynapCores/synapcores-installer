@@ -145,13 +145,44 @@ check_distro() {
     . /etc/os-release
 
     case "${ID:-unknown}:${VERSION_ID:-?}" in
-        ubuntu:22.04|debian:12)
+        ubuntu:22.04)
             log "Distro: ${PRETTY_NAME:-$ID $VERSION_ID} — supported (FFmpeg 4 build)."
             DISTRO_TAG=""
             ;;
         ubuntu:24.04|debian:13)
             log "Distro: ${PRETTY_NAME:-$ID $VERSION_ID} — supported (FFmpeg 6 build)."
             DISTRO_TAG="-ubuntu24"
+            ;;
+        debian:12)
+            # Debian 12 (bookworm) ships FFmpeg 5.1.x with libavutil.so.57.
+            # Our Ubuntu 22.04 build is linked against libavutil.so.56
+            # (FFmpeg 4); our Ubuntu 24.04 build is linked against
+            # libavutil.so.58 (FFmpeg 6). Neither matches Debian 12.
+            # Until v1.3.2 ships a Debian 12 native build, route Debian
+            # 12 users to Docker (which bundles its own FFmpeg).
+            cat >&2 <<DEBIAN12_EOF
+
+[get-synapcores] Debian 12 (bookworm) is supported via Docker, not the native binary.
+
+Reason: Debian 12 ships FFmpeg 5.1 (libavutil.so.57). The CE native
+binary is built against either FFmpeg 4 (libavutil.so.56, Ubuntu 22.04)
+or FFmpeg 6 (libavutil.so.58, Ubuntu 24.04). Neither matches Debian 12's
+FFmpeg ABI, so the binary won't dynamically link.
+
+Run via Docker:
+
+  docker run -d --name synapcores -p 8080:8080 \\
+             -v synapcores-data:/var/lib/synapcores \\
+             -e AIDB_JWT_SECRET="\$(openssl rand -base64 32)" \\
+             ghcr.io/synapcores/community:latest
+
+  docker logs -f synapcores | grep -A 7 FIRST-BOOT
+
+A Debian 12 native build is queued for v1.3.2-ce. Until then the
+Docker image is the supported path.
+
+DEBIAN12_EOF
+            exit 1
             ;;
         ubuntu:20.04|ubuntu:18.04|debian:11|debian:10)
             cat >&2 <<DISTRO_OLD_EOF
@@ -345,23 +376,19 @@ $SUDO_PREFIX install -m 0755 "$BINARY_SRC" "${INSTALL_PREFIX}/synapcores" \
 log "Installed: ${INSTALL_PREFIX}/synapcores"
 
 # ---------------------------------------------------------------------
-# Verify install
+# Verify install (deferred on both OSes)
 # ---------------------------------------------------------------------
 #
-# On macOS the binary won't run yet because Homebrew's ffmpeg /
-# tesseract / leptonica aren't necessarily installed — the dynamic
-# linker would fail to find libavformat.dylib etc., and `--version`
-# silently exits with no output. Skip the edition check on darwin and
-# rely on the post-install instructions to walk the user through the
-# Homebrew deps.
-
-if [ "$DETECTED_OS" = "linux" ]; then
-    if "${INSTALL_PREFIX}/synapcores" --version 2>/dev/null | grep -q "Community"; then
-        log "Edition check: $("${INSTALL_PREFIX}/synapcores" --version)"
-    else
-        warn "binary installed but did not report 'Community' on --version"
-    fi
-fi
+# Skipped here intentionally. The CE binary is dynamically linked
+# against FFmpeg / Tesseract / Leptonica that aren't installed yet —
+#   - macOS: Homebrew may not have them installed
+#   - Linux: install-ce.sh runs apt-get for them next
+# So `synapcores --version` would fail with "error while loading
+# shared libraries: libavutil.so.56" on a fresh box and the
+# resulting "binary did not report 'Community'" warning would mislead
+# the operator into thinking the wrong edition was downloaded.
+# install-ce.sh does the version check AFTER its install_runtime_deps
+# step, which is the right point.
 
 # ---------------------------------------------------------------------
 # System setup (or skip)
