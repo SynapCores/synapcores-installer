@@ -145,15 +145,4 @@ repository and pushes signed binary artifacts to a separate public repo
 ([`SynapCores/synapcores-releases`](https://github.com/SynapCores/synapcores-releases/releases))
 on every tag. This `install.sh` knows how to find them there.
 
-## Updating the script
 
-The canonical source for this installer lives in the private source
-repository at `scripts/install/get-synapcores-ce.sh`. When that changes,
-copy the new contents into this repo's `install.sh` on `main` and the
-GitHub Pages cache will pick it up within a few minutes.
-
-## DNS
-
-`get.synapcores.com` is a CNAME pointing at `synapcores.github.io.`.
-GitHub Pages auto-provisions and renews a Let's Encrypt certificate for
-the custom domain after the CNAME is verified.
