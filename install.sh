@@ -360,6 +360,22 @@ fi
 # Install binary
 # ---------------------------------------------------------------------
 
+# v1.6.4.1 fix: on Apple Silicon Macs /usr/local/bin doesn't exist by
+# default (Homebrew lives at /opt/homebrew/bin there). When the user
+# hasn't pinned SYNAPCORES_PREFIX, prefer the Homebrew bin dir if
+# it's present so the binary lands inside the user's existing $PATH.
+# Falls back to /usr/local/bin only if Homebrew isn't there. Intel
+# Macs and Linux keep the original /usr/local/bin default since
+# that's where their Homebrew lives too (Intel) or always exists
+# (most Linux distros).
+if [ -z "${SYNAPCORES_PREFIX:-}" ] \
+   && [ "$DETECTED_OS" = "darwin" ] \
+   && [ "$DETECTED_ARCH" = "aarch64" ] \
+   && [ -d /opt/homebrew/bin ]; then
+    INSTALL_PREFIX="/opt/homebrew/bin"
+    log "Apple Silicon detected with Homebrew; using ${INSTALL_PREFIX}"
+fi
+
 # POSIX sh has no $EUID — use `id -u`. Also POSIX has no arrays, so we
 # use SUDO_PREFIX as a (possibly empty) string that is word-split into
 # argv when the install command runs.
@@ -370,10 +386,38 @@ else
     SUDO_PREFIX="sudo"
 fi
 
+# v1.6.4.1 fix: ensure the install directory exists before invoking
+# install(1). On a fresh Apple Silicon Mac /usr/local/bin doesn't exist
+# yet, which made BSD install fail with the cryptic
+#   "install: /usr/local/bin/INS@<random>: No such file or directory"
+# error — INS@* is the BSD-install atomic-rename tempfile, and it
+# can't be created in a directory that doesn't exist.
+# shellcheck disable=SC2086
+$SUDO_PREFIX mkdir -p "$INSTALL_PREFIX" \
+    || fail "could not create ${INSTALL_PREFIX} (need write or sudo)"
+
 # shellcheck disable=SC2086
 $SUDO_PREFIX install -m 0755 "$BINARY_SRC" "${INSTALL_PREFIX}/synapcores" \
     || fail "binary install failed"
 log "Installed: ${INSTALL_PREFIX}/synapcores"
+
+# v1.6.4.1: surface the PATH hint when we installed somewhere that
+# isn't already on the user's PATH. Saves the next 60 seconds of
+# "synapcores: command not found" frustration.
+case ":${PATH}:" in
+    *":${INSTALL_PREFIX}:"*) ;; # already on PATH
+    *)
+        cat >&2 <<PATH_HINT_EOF
+
+[get-synapcores] ${INSTALL_PREFIX} is not on your \$PATH. Add it
+with:
+
+    export PATH="${INSTALL_PREFIX}:\$PATH"
+
+(append the same line to ~/.zshrc or ~/.bashrc to make it permanent).
+PATH_HINT_EOF
+        ;;
+esac
 
 # ---------------------------------------------------------------------
 # Verify install (deferred on both OSes)
