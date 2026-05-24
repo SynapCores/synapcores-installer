@@ -290,7 +290,9 @@ esac
 # Resolve version
 # ---------------------------------------------------------------------
 
+AUTO_RESOLVED=0
 if [ -z "$PINNED_VERSION" ]; then
+    AUTO_RESOLVED=1
     log "Resolving latest release..."
     # IMPORTANT: no -L. With -L, curl follows the redirect and
     # %{redirect_url} comes back empty. We need GitHub's 302 Location
@@ -313,6 +315,33 @@ log "Version: $PINNED_VERSION"
 TARBALL="synapcores-ce-${PINNED_VERSION}-${PLATFORM}${DISTRO_TAG}.tar.gz"
 TARBALL_URL="${RELEASE_BASE}/download/${PINNED_VERSION}/${TARBALL}"
 CHECKSUM_URL="${TARBALL_URL}.sha256"
+
+# "alias to latest available": GitHub's release `latest` is global, not
+# per-platform. If the resolved latest release has no binary for THIS platform
+# (e.g. a Linux-only release), fall back to the newest release that does — so
+# Mac/ARM users always get the latest *available* build instead of a 404.
+# Only when the version was auto-resolved; a pinned $SYNAPCORES_VERSION fails loud.
+asset_exists() { curl -fsSL -r 0-0 -o /dev/null "$1" 2>/dev/null; }
+if [ "$AUTO_RESOLVED" = "1" ] && ! asset_exists "$TARBALL_URL"; then
+    warn "No ${PLATFORM}${DISTRO_TAG} binary in ${PINNED_VERSION}; finding the latest release that has one..."
+    _found=0
+    _tags=$(curl -fsSL "https://api.github.com/repos/${GITHUB_REPO}/releases?per_page=20" 2>/dev/null \
+              | grep '"tag_name":' | sed -E 's/.*"tag_name":[[:space:]]*"([^"]+)".*/\1/')
+    for _t in $_tags; do
+        _cand="synapcores-ce-${_t}-${PLATFORM}${DISTRO_TAG}.tar.gz"
+        _url="${RELEASE_BASE}/download/${_t}/${_cand}"
+        if asset_exists "$_url"; then
+            log "Using ${_t} — latest release with a ${PLATFORM}${DISTRO_TAG} binary."
+            PINNED_VERSION="$_t"
+            TARBALL="$_cand"
+            TARBALL_URL="$_url"
+            CHECKSUM_URL="${_url}.sha256"
+            _found=1
+            break
+        fi
+    done
+    [ "$_found" = "1" ] || fail "no ${PLATFORM}${DISTRO_TAG} binary in recent releases — run via Docker instead: docker run -d -p 8080:8080 synapcores/community:latest"
+fi
 
 WORK_DIR=$(mktemp -d)
 trap 'rm -rf "$WORK_DIR"' EXIT INT TERM
