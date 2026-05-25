@@ -104,6 +104,9 @@ available, but Intel Mac users should run via Docker:
 
   docker run -p 8080:8080 -v synapcores-data:/var/lib/synapcores \\
              -e AIDB_JWT_SECRET="\$(openssl rand -base64 32)" \\
+             synapcores/community:latest
+
+             # Behind a proxy / CI / rate-limited? use this one instead:
              ghcr.io/synapcores/community:latest
 
 Apple discontinued Intel Macs in 2023 and the GitHub-hosted macos-13
@@ -174,6 +177,9 @@ Run via Docker:
   docker run -d --name synapcores -p 8080:8080 \\
              -v synapcores-data:/var/lib/synapcores \\
              -e AIDB_JWT_SECRET="\$(openssl rand -base64 32)" \\
+             synapcores/community:latest
+
+             # Behind a proxy / CI / rate-limited? use this one instead:
              ghcr.io/synapcores/community:latest
 
   docker logs -f synapcores | grep -A 7 FIRST-BOOT
@@ -197,6 +203,9 @@ Options:
   2. Run via Docker (works on any Linux):
        docker run -p 8080:8080 -v synapcores-data:/var/lib/synapcores \\
                   -e AIDB_JWT_SECRET="\$(openssl rand -base64 32)" \\
+                  synapcores/community:latest
+
+                  # Behind a proxy / CI / rate-limited? use this one instead:
                   ghcr.io/synapcores/community:latest
 
 Full distro matrix: https://docs.synapcores.com/requirements/#supported-linux-distributions
@@ -218,6 +227,9 @@ Workarounds:
   1. Run via Docker (works on any Linux):
        docker run -p 8080:8080 -v synapcores-data:/var/lib/synapcores \\
                   -e AIDB_JWT_SECRET="\$(openssl rand -base64 32)" \\
+                  synapcores/community:latest
+
+                  # Behind a proxy / CI / rate-limited? use this one instead:
                   ghcr.io/synapcores/community:latest
 
   2. Use a supported distro in a VM or container.
@@ -253,6 +265,9 @@ DISTRO_RHEL_OLD_EOF
 Use the Docker image (which is glibc-based) instead:
   docker run -p 8080:8080 -v synapcores-data:/var/lib/synapcores \\
              -e AIDB_JWT_SECRET="\$(openssl rand -base64 32)" \\
+             synapcores/community:latest
+
+             # Behind a proxy / CI / rate-limited? use this one instead:
              ghcr.io/synapcores/community:latest
 
 ALPINE_EOF
