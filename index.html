@@ -358,6 +358,28 @@ if [ "$AUTO_RESOLVED" = "1" ] && ! asset_exists "$TARBALL_URL"; then
     [ "$_found" = "1" ] || fail "no ${PLATFORM}${DISTRO_TAG} binary in recent releases — run via Docker instead: docker run -d -p 8080:8080 synapcores/community:latest"
 fi
 
+# ---------------------------------------------------------------------
+# Anonymous install counter ping (no PII, opt-out via COUNTER_OPT_OUT=1)
+# ---------------------------------------------------------------------
+# Fires a single GET to the install-counter endpoint right after we've
+# resolved the platform + version and committed to an install — but
+# BEFORE the download starts. This is how we count installs by OS/arch/
+# version. Until this existed, Linux + Windows installs were invisible
+# (curl-pipe-sh leaves no trace on GitHub Pages); the binary download
+# itself is counted on GitHub Releases for Linux/Windows users via this
+# path. Total bytes added to the network footprint: < 200 bytes.
+#
+# No personal data is sent — just the platform string and version tag,
+# both already public (they're literally in the tarball URL above).
+# 5-second timeout. `|| true` means: if the counter is down, the
+# install still proceeds. We never block on telemetry.
+#
+# Set COUNTER_OPT_OUT=1 in your environment to skip the ping entirely.
+if [ -z "${COUNTER_OPT_OUT:-}" ]; then
+    _counter_url="https://synapcores.com/api/install-counter?v=${PINNED_VERSION}&os=${DETECTED_OS}&arch=${DETECTED_ARCH}&channel=cli"
+    curl -fsSL --max-time 5 -o /dev/null "$_counter_url" 2>/dev/null || true
+fi
+
 WORK_DIR=$(mktemp -d)
 trap 'rm -rf "$WORK_DIR"' EXIT INT TERM
 
