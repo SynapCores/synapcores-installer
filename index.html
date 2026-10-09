@@ -104,6 +104,7 @@ available, but Intel Mac users should run via Docker:
 
   docker run -p 8080:8080 -v synapcores-data:/var/lib/synapcores \\
              -e AIDB_JWT_SECRET="\$(openssl rand -base64 32)" \\
+             -e AIDB_ENCRYPTION_KEY="\$(openssl rand -base64 32)" \\
              synapcores/community:latest
 
              # Behind a proxy / CI / rate-limited? use this one instead:
@@ -177,6 +178,7 @@ Run via Docker:
   docker run -d --name synapcores -p 8080:8080 \\
              -v synapcores-data:/var/lib/synapcores \\
              -e AIDB_JWT_SECRET="\$(openssl rand -base64 32)" \\
+             -e AIDB_ENCRYPTION_KEY="\$(openssl rand -base64 32)" \\
              synapcores/community:latest
 
              # Behind a proxy / CI / rate-limited? use this one instead:
@@ -203,6 +205,7 @@ Options:
   2. Run via Docker (works on any Linux):
        docker run -p 8080:8080 -v synapcores-data:/var/lib/synapcores \\
                   -e AIDB_JWT_SECRET="\$(openssl rand -base64 32)" \\
+                  -e AIDB_ENCRYPTION_KEY="\$(openssl rand -base64 32)" \\
                   synapcores/community:latest
 
                   # Behind a proxy / CI / rate-limited? use this one instead:
@@ -227,6 +230,7 @@ Workarounds:
   1. Run via Docker (works on any Linux):
        docker run -p 8080:8080 -v synapcores-data:/var/lib/synapcores \\
                   -e AIDB_JWT_SECRET="\$(openssl rand -base64 32)" \\
+                  -e AIDB_ENCRYPTION_KEY="\$(openssl rand -base64 32)" \\
                   synapcores/community:latest
 
                   # Behind a proxy / CI / rate-limited? use this one instead:
@@ -265,6 +269,7 @@ DISTRO_RHEL_OLD_EOF
 Use the Docker image (which is glibc-based) instead:
   docker run -p 8080:8080 -v synapcores-data:/var/lib/synapcores \\
              -e AIDB_JWT_SECRET="\$(openssl rand -base64 32)" \\
+             -e AIDB_ENCRYPTION_KEY="\$(openssl rand -base64 32)" \\
              synapcores/community:latest
 
              # Behind a proxy / CI / rate-limited? use this one instead:
@@ -624,7 +629,10 @@ if [ "$DETECTED_OS" = "darwin" ]; then
 [server]
 listen_addr     = "127.0.0.1:8080"
 max_body_size   = 1073741824
-request_timeout = 30
+# Seconds, at the HTTP layer. 30 cuts the connection before a cold GENERATE
+# (~2 min on CPU) can answer, which defeats default_timeout_ms on its own.
+# The Docker image has used 300 for this reason.
+request_timeout = 300
 enable_cors     = true
 data_dir = "${SC_DATA_DIR}"
 
@@ -634,12 +642,22 @@ token_expiration = 86400
 
 [query]
 max_concurrent_queries = 32
-default_timeout_ms     = 30000
+# 5 minutes. 30000 (30 s) was the value the engine deliberately moved away from
+# in v1.6.5: a cold GENERATE on a CPU-only host takes ~2 minutes, so LLM-backed
+# SQL (GENERATE, AGENT_RUN, NL2SQL) failed with "Operation timeout" out of the
+# box. Lower it deliberately if you want fail-fast OLTP behaviour.
+default_timeout_ms     = 300000
 
 [query.ai_service]
-provider        = "native"
-model           = "llama-3.2-1b-instruct-q4_k_m"
-embedding_model = "minilm"
+# Same stack as install-ce.sh and the Docker image. v1.8.0-ce moved the default
+# from `native` (filesystem-resolved GGUF) to `local` (in-process model registry),
+# and qwen2.5-coder:7b is the model the engine is verified against for AGENT_RUN
+# tool-call JSON and the recipe builder. A <=1B model is materially weaker at both.
+provider        = "local"
+model           = "qwen2.5-coder:7b"
+embedding_model = "all-minilm:latest"
+# Lets the gateway self-heal a missing model on first use.
+auto_pull       = true
 
 [ai_cache]
 enabled              = false
@@ -651,60 +669,85 @@ MIN_CFG
         log "Wrote minimal config to ${SC_CONFIG}"
     fi
 
-    # ----- Offer to download the default LLM (GGUF) -----
-    DEFAULT_MODEL_FILE="${SC_MODELS_DIR}/llama-3.2-1b-instruct-q4_k_m.gguf"
-    DEFAULT_MODEL_URL="https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf"
+    # ----- Offer to pre-pull the default LLM (registry) -----
+    # Acquisition goes through `synapcores pull` (registry.ollama.ai) to match
+    # install-ce.sh and the Docker image. The old path curl'd a 700 MB GGUF
+    # straight from HuggingFace for a model nothing else in the product used.
+    DEFAULT_MODEL="qwen2.5-coder:7b"
 
-    if [ -f "$DEFAULT_MODEL_FILE" ]; then
-        log "Default LLM already at ${DEFAULT_MODEL_FILE}"
-    elif [ -n "${SYNAPCORES_NO_MODEL_DOWNLOAD:-}" ]; then
-        log "SYNAPCORES_NO_MODEL_DOWNLOAD set; skipping LLM download."
-        log "AI Chat will fall back to whichever provider is enabled in the config."
+    if [ -n "${SYNAPCORES_NO_MODEL_DOWNLOAD:-}" ]; then
+        log "SYNAPCORES_NO_MODEL_DOWNLOAD set; skipping the model pull."
+        log "auto_pull = true in the config fetches it on first EMBED / GENERATE."
     else
         if [ -n "${SYNAPCORES_NONINTERACTIVE:-}" ]; then
-            log "Non-interactive: downloading default LLM..."
+            log "Non-interactive: pre-pulling ${DEFAULT_MODEL}..."
             DL_ANSWER="y"
         elif [ ! -t 0 ] && [ ! -e /dev/tty ]; then
-            warn "Cannot prompt for LLM download (no tty). Skipping."
-            warn "Download manually:  curl -L -o ${DEFAULT_MODEL_FILE} ${DEFAULT_MODEL_URL}"
+            warn "Cannot prompt for the model pull (no tty). Skipping."
+            warn "auto_pull = true means the first EMBED / GENERATE fetches it."
             DL_ANSWER="n"
         else
-            printf '\033[1;34m[get-synapcores]\033[0m Download default LLM (Llama 3.2 1B Q4_K_M, ~700MB)? [Y/n] '
+            printf '\033[1;34m[get-synapcores]\033[0m Pre-pull default LLM (%s, ~4.4GB)? [Y/n] ' "$DEFAULT_MODEL"
             read -r DL_ANSWER < /dev/tty || DL_ANSWER="n"
         fi
 
         case "$DL_ANSWER" in
             ""|[Yy]*)
-                log "Downloading ${DEFAULT_MODEL_URL}"
-                log "  → ${DEFAULT_MODEL_FILE}"
-                if curl -fL --progress-bar -o "${DEFAULT_MODEL_FILE}.tmp" "$DEFAULT_MODEL_URL"; then
-                    mv "${DEFAULT_MODEL_FILE}.tmp" "$DEFAULT_MODEL_FILE"
-                    log "  ✓ downloaded $(du -h "$DEFAULT_MODEL_FILE" | cut -f1)"
+                log "Pulling ${DEFAULT_MODEL} (this can take a while)..."
+                if AIDB_ACCEPT_LICENSE=1 "${INSTALL_PREFIX}/synapcores" pull "$DEFAULT_MODEL"; then
+                    log "  ✓ ${DEFAULT_MODEL} installed"
                 else
-                    warn "Download failed. Skip and retry later via:"
-                    warn "  curl -L -o ${DEFAULT_MODEL_FILE} ${DEFAULT_MODEL_URL}"
-                    rm -f "${DEFAULT_MODEL_FILE}.tmp"
+                    warn "Pull failed. The engine will retry on first use (auto_pull = true)."
+                    warn "Or run it yourself:  ${INSTALL_PREFIX}/synapcores pull ${DEFAULT_MODEL}"
                 fi
                 ;;
             *)
-                log "Skipped. Download manually any time:"
-                log "  curl -L -o ${DEFAULT_MODEL_FILE} ${DEFAULT_MODEL_URL}"
-                log "Or edit ${SC_CONFIG} to change [query.ai_service] provider."
+                log "Skipped — the engine pulls on first use (auto_pull = true)."
+                log "Pre-pull later:          ${INSTALL_PREFIX}/synapcores pull ${DEFAULT_MODEL}"
+                log "Smaller box? try:        ${INSTALL_PREFIX}/synapcores pull tinyllama:latest"
+                log "                         then set model = \"tinyllama:latest\" in ${SC_CONFIG}"
                 ;;
         esac
     fi
 
-    # The native provider uses AIDB_MODELS_DIR to locate GGUF files.
-    # Hard-code the path users shouldn't have to discover.
-    SC_MODELS_DIR_ABS="$SC_MODELS_DIR"
+    # ----- Credential-encryption key for the data lake -----
+    # Without this the gateway still starts, but logs
+    #   "Data lake failed to start: AIDB_ENCRYPTION_KEY is not set"
+    # and every /v1/lake/* call answers 503. There is deliberately no config key
+    # for it, so it has to be an environment variable. It must stay STABLE: it
+    # encrypts stored object-store credentials, and changing it makes them
+    # undecryptable.
+    SC_ENV_FILE="${SC_HOME}/synapcores.env"
+    if [ -f "$SC_ENV_FILE" ] && grep -q "AIDB_ENCRYPTION_KEY" "$SC_ENV_FILE" 2>/dev/null; then
+        log "Reusing existing secrets in ${SC_ENV_FILE}"
+    else
+        SC_ENC_KEY="$(openssl rand -base64 32 2>/dev/null || head -c 32 /dev/urandom | base64)"
+        SC_JWT_SECRET="$(openssl rand -base64 32 2>/dev/null || head -c 32 /dev/urandom | base64)"
+        umask 077
+        cat >"$SC_ENV_FILE" <<ENV_EOF
+# SynapCores runtime secrets — generated by get.synapcores.com
+# Keep these STABLE across restarts. AIDB_ENCRYPTION_KEY encrypts stored data
+# lake credentials; changing it makes existing ones undecryptable.
+export AIDB_JWT_SECRET="${SC_JWT_SECRET}"
+export AIDB_ENCRYPTION_KEY="${SC_ENC_KEY}"
+export AIDB_MODELS_DIR="${SC_MODELS_DIR}"
+ENV_EOF
+        chmod 600 "$SC_ENV_FILE"
+        log "Wrote secrets to ${SC_ENV_FILE} (mode 600)"
+    fi
 
     cat <<MAC_FINISH_EOF
 
 [get-synapcores] Done — start the gateway
 
-  export AIDB_JWT_SECRET="\$(openssl rand -base64 32)"
-  export AIDB_MODELS_DIR="${SC_MODELS_DIR_ABS}"
+  source ${SC_ENV_FILE}
   ${INSTALL_PREFIX}/synapcores --config ${SC_CONFIG}
+
+  ${SC_ENV_FILE} holds AIDB_JWT_SECRET, AIDB_ENCRYPTION_KEY and
+  AIDB_MODELS_DIR. Source it on every start, and keep the file: the
+  encryption key protects stored data-lake credentials, so if it changes
+  those credentials can no longer be read. Without it the gateway still
+  starts, but logs "Data lake failed to start" and /v1/lake/* returns 503.
 
 The first start prints an admin password — capture it from the log
 output. Then open the Web UI at http://localhost:8080/

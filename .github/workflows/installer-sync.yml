@@ -1,0 +1,37 @@
+name: installer consistency
+
+on: [push, pull_request]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # index.html IS the installer: GitHub Pages serves it at /, so
+      # `curl https://get.synapcores.com | sh` runs this file. install.sh is the
+      # same script at /install.sh. They must stay byte-identical — the macOS
+      # install shipped a stale timeout and a stale model for months because one
+      # copy was fixed and the other was not.
+      - name: index.html and install.sh must be identical
+        run: |
+          if ! diff -u install.sh index.html; then
+            echo "::error::index.html has drifted from install.sh. Run: cp install.sh index.html"
+            exit 1
+          fi
+
+      - name: shell syntax
+        run: sh -n install.sh
+
+      # These values are duplicated in aidb/scripts/install/*.sh and the Docker
+      # image's gateway.toml. A mismatch is what put a 30s timeout and a 1B model
+      # on every Mac install while Linux got 300s and qwen.
+      - name: config defaults match the rest of the product
+        run: |
+          fail=0
+          grep -q 'default_timeout_ms *= *300000' install.sh || { echo "::error::default_timeout_ms must be 300000 (30000 is the value the engine moved away from in v1.6.5)"; fail=1; }
+          grep -q 'request_timeout = 300'          install.sh || { echo "::error::server request_timeout must be 300s; 30s cuts a cold GENERATE off at the HTTP layer"; fail=1; }
+          grep -q 'provider *= *"local"'           install.sh || { echo "::error::provider must be local, matching install-ce.sh and the image"; fail=1; }
+          grep -q 'model *= *"qwen2.5-coder:7b"'   install.sh || { echo "::error::model must be qwen2.5-coder:7b"; fail=1; }
+          grep -q 'AIDB_ENCRYPTION_KEY'            install.sh || { echo "::error::must set AIDB_ENCRYPTION_KEY or the data lake returns 503"; fail=1; }
+          exit $fail

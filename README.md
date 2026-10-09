@@ -146,3 +146,23 @@ repository and pushes signed binary artifacts to a separate public repo
 on every tag. This `install.sh` knows how to find them there.
 
 
+
+## Keeping the installer consistent
+
+`index.html` **is** the installer. GitHub Pages serves it at `/`, so
+`curl https://get.synapcores.com | sh` executes that file; `install.sh` is the
+same script served at `/install.sh`. **They must be byte-identical** — edit
+`install.sh`, then:
+
+```sh
+cp install.sh index.html
+```
+
+`.github/workflows/installer-sync.yml` fails the build if they drift, and also
+asserts the config values this script writes still match the rest of the product
+(`default_timeout_ms = 300000`, `provider = "local"`, `model = "qwen2.5-coder:7b"`,
+and that `AIDB_ENCRYPTION_KEY` is set).
+
+Those values are duplicated in `aidb/scripts/install/install-ce.sh`,
+`aidb/scripts/install/get-synapcores-ce.sh` and the Docker image's
+`gateway.toml`. Changing a default means changing all four.
