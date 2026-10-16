@@ -8,8 +8,28 @@
 # Usage:
 #   curl -fsSL https://get.synapcores.com/install.sh | sh
 #
+# Quick userland test (no sudo, no system service, no /opt or /etc):
+#   curl -fsSL https://get.synapcores.com/install.sh | SYNAPCORES_USER_INSTALL=1 sh
+#
 # Or, to pin a specific release:
 #   curl -fsSL https://get.synapcores.com/install.sh | SYNAPCORES_VERSION=v1.2.0 sh
+#
+# Environment variables:
+#   SYNAPCORES_USER_INSTALL=1   Install for the current user only:
+#                               binary → ~/.local/bin, config + data →
+#                               ~/.synapcores, no system user, no
+#                               systemd unit. Good for kicking the
+#                               tires without touching system state.
+#   SYNAPCORES_PREFIX=<dir>     Override the binary install dir
+#                               (default: /usr/local/bin in system
+#                               mode, ~/.local/bin in user mode).
+#   SYNAPCORES_BINARY_ONLY=1    Drop the binary and stop. Operator
+#                               handles config and service themselves.
+#   SYNAPCORES_VERSION=<tag>    Pin a specific release tag.
+#   SYNAPCORES_NONINTERACTIVE=1 Skip prompts; assume safe defaults.
+#   SYNAPCORES_WITH_NLI=1      Install and enable semantic verification.
+#   SYNAPCORES_NLI_MODEL=...   Curated alias (default nli-default; nli-xsmall optional).
+#   SYNAPCORES_NO_MODEL_DOWNLOAD=1  Use previously imported models, without pulling.
 #
 # Written in POSIX sh on purpose: when invoked via `curl ... | sh`,
 # Debian/Ubuntu's /bin/sh is dash, not bash. Bash-only constructs like
@@ -22,9 +42,11 @@
 #   2. Resolves the latest GitHub release tag (or honors $SYNAPCORES_VERSION)
 #   3. Downloads the matching binary tarball + checksum
 #   4. Verifies the checksum
-#   5. Drops the binary at /usr/local/bin/synapcores (or asks if non-root)
-#   6. Hands off to install-ce.sh for system setup (user, paths,
-#      systemd unit, default config), unless SYNAPCORES_BINARY_ONLY is set
+#   5. Drops the binary at /usr/local/bin/synapcores (system mode,
+#      requires sudo) or ~/.local/bin/synapcores (user mode, no sudo).
+#   6. Hands off to install-ce.sh for setup (system: useradd, /opt
+#      layout, /etc/systemd unit; user: ~/.synapcores layout, no
+#      systemd unit). Skipped entirely if SYNAPCORES_BINARY_ONLY is set.
 #
 # Requirements:
 #   - curl
@@ -40,8 +62,16 @@ set -eu
 GITHUB_REPO="${SYNAPCORES_REPO:-SynapCores/synapcores-releases}"
 RELEASE_BASE="https://github.com/${GITHUB_REPO}/releases"
 PINNED_VERSION="${SYNAPCORES_VERSION:-}"
-INSTALL_PREFIX="${SYNAPCORES_PREFIX:-/usr/local/bin}"
 BINARY_ONLY="${SYNAPCORES_BINARY_ONLY:-}"
+# User-mode install: opt in via SYNAPCORES_USER_INSTALL=1, or via
+# interactive prompt (Linux only) when stdin is a tty and the operator
+# hasn't set the env var. Default = system mode.
+USER_INSTALL="${SYNAPCORES_USER_INSTALL:-}"
+# INSTALL_PREFIX default depends on USER_INSTALL — resolved after the
+# (possibly interactive) prompt below so we honor a late opt-in.
+INSTALL_PREFIX="${SYNAPCORES_PREFIX:-}"
+NLI_OPT_IN="${SYNAPCORES_WITH_NLI:-0}"
+NLI_MODEL="${SYNAPCORES_NLI_MODEL:-nli-default}"
 
 # ---------------------------------------------------------------------
 # Helpers
@@ -50,6 +80,16 @@ BINARY_ONLY="${SYNAPCORES_BINARY_ONLY:-}"
 log()   { printf '\033[1;34m[get-synapcores]\033[0m %s\n' "$*"; }
 warn()  { printf '\033[1;33m[get-synapcores]\033[0m %s\n' "$*" >&2; }
 fail()  { printf '\033[1;31m[get-synapcores]\033[0m %s\n' "$*" >&2; exit 1; }
+
+case "$NLI_OPT_IN" in
+    1|true|yes) NLI_OPT_IN=1 ;;
+    0|false|no|"") NLI_OPT_IN=0 ;;
+    *) fail "SYNAPCORES_WITH_NLI must be 0 or 1" ;;
+esac
+case "$NLI_MODEL" in
+    nli-default|nli-small|nli-xsmall) ;;
+    *) fail "Unknown NLI model; use nli-default or nli-xsmall" ;;
+esac
 
 require() {
     command -v "$1" >/dev/null 2>&1 || fail "missing required tool: $1"
@@ -89,6 +129,60 @@ detect_platform() {
         *)              fail "unsupported architecture: $DETECTED_ARCH" ;;
     esac
 
+    printf '%s-%s\n' "$DETECTED_OS" "$DETECTED_ARCH"
+}
+
+# perf-wave-10B: detect_gpu — pick between CPU and CUDA tarball variants.
+#
+# Sets DETECTED_GPU to "cpu" or "cuda". Override via SYNAPCORES_GPU env
+# var:
+#   SYNAPCORES_GPU=cpu  curl ... | sh   (force CPU even on a GPU host)
+#   SYNAPCORES_GPU=cuda curl ... | sh   (skip detection, demand CUDA)
+#
+# CUDA variant is published only for linux-x86_64. macOS / aarch64
+# always resolve to "cpu" — Apple Silicon uses Metal (separate codepath),
+# and we don't ship aarch64 CUDA tarballs.
+detect_gpu() {
+    DETECTED_GPU=cpu
+
+    # Allow explicit override before we run any detection.
+    if [ -n "${SYNAPCORES_GPU:-}" ]; then
+        DETECTED_GPU="$SYNAPCORES_GPU"
+        log "GPU override: SYNAPCORES_GPU=${SYNAPCORES_GPU}"
+        return
+    fi
+
+    # No CUDA build for macOS or for aarch64 — Apple uses Metal, and
+    # we don't currently publish aarch64 CUDA tarballs.
+    if [ "$DETECTED_OS" = "darwin" ]; then return; fi
+    if [ "$DETECTED_ARCH" = "aarch64" ]; then return; fi
+
+    # Primary signal: nvidia-smi works (driver is loaded + GPU visible).
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        if nvidia-smi >/dev/null 2>&1; then
+            DETECTED_GPU=cuda
+            log "NVIDIA GPU detected via nvidia-smi"
+            return
+        fi
+    fi
+
+    # Fallback: libcuda.so.1 present (covers headless servers without
+    # nvidia-smi installed but with the runtime driver lib in place).
+    if [ -f /usr/lib/x86_64-linux-gnu/libcuda.so.1 ] \
+       || [ -f /usr/lib64/libcuda.so.1 ] \
+       || [ -f /usr/lib/libcuda.so.1 ]; then
+        DETECTED_GPU=cuda
+        log "CUDA runtime library (libcuda.so.1) detected"
+        return
+    fi
+
+    log "No CUDA detected — using CPU build"
+}
+
+# detect_intel_mac_unsupported: bail out on Intel Macs (no native binary
+# published). Split out from detect_platform() because POSIX `$(...)` runs
+# the function in a subshell and `exit` from there only kills the subshell.
+detect_intel_mac_unsupported() {
     # Intel Mac native binary is not published as of v1.3.0-ce. The
     # source migration to ffmpeg-next 7 unblocked the build, but
     # GitHub-hosted macos-13 runner availability has been unreliable
@@ -105,9 +199,6 @@ available, but Intel Mac users should run via Docker:
   docker run -p 8080:8080 -v synapcores-data:/var/lib/synapcores \\
              -e AIDB_JWT_SECRET="\$(openssl rand -base64 32)" \\
              -e AIDB_ENCRYPTION_KEY="\$(openssl rand -base64 32)" \\
-             synapcores/community:latest
-
-             # Behind a proxy / CI / rate-limited? use this one instead:
              ghcr.io/synapcores/community:latest
 
 Apple discontinued Intel Macs in 2023 and the GitHub-hosted macos-13
@@ -120,8 +211,6 @@ Full platform matrix: https://docs.synapcores.com/requirements/
 INTEL_MAC_EOF
         exit 1
     fi
-
-    printf '%s-%s\n' "$DETECTED_OS" "$DETECTED_ARCH"
 }
 
 # check_distro: verify the host runs a supported Linux distribution
@@ -179,9 +268,6 @@ Run via Docker:
              -v synapcores-data:/var/lib/synapcores \\
              -e AIDB_JWT_SECRET="\$(openssl rand -base64 32)" \\
              -e AIDB_ENCRYPTION_KEY="\$(openssl rand -base64 32)" \\
-             synapcores/community:latest
-
-             # Behind a proxy / CI / rate-limited? use this one instead:
              ghcr.io/synapcores/community:latest
 
   docker logs -f synapcores | grep -A 7 FIRST-BOOT
@@ -206,9 +292,6 @@ Options:
        docker run -p 8080:8080 -v synapcores-data:/var/lib/synapcores \\
                   -e AIDB_JWT_SECRET="\$(openssl rand -base64 32)" \\
                   -e AIDB_ENCRYPTION_KEY="\$(openssl rand -base64 32)" \\
-                  synapcores/community:latest
-
-                  # Behind a proxy / CI / rate-limited? use this one instead:
                   ghcr.io/synapcores/community:latest
 
 Full distro matrix: https://docs.synapcores.com/requirements/#supported-linux-distributions
@@ -231,9 +314,6 @@ Workarounds:
        docker run -p 8080:8080 -v synapcores-data:/var/lib/synapcores \\
                   -e AIDB_JWT_SECRET="\$(openssl rand -base64 32)" \\
                   -e AIDB_ENCRYPTION_KEY="\$(openssl rand -base64 32)" \\
-                  synapcores/community:latest
-
-                  # Behind a proxy / CI / rate-limited? use this one instead:
                   ghcr.io/synapcores/community:latest
 
   2. Use a supported distro in a VM or container.
@@ -270,9 +350,6 @@ Use the Docker image (which is glibc-based) instead:
   docker run -p 8080:8080 -v synapcores-data:/var/lib/synapcores \\
              -e AIDB_JWT_SECRET="\$(openssl rand -base64 32)" \\
              -e AIDB_ENCRYPTION_KEY="\$(openssl rand -base64 32)" \\
-             synapcores/community:latest
-
-             # Behind a proxy / CI / rate-limited? use this one instead:
              ghcr.io/synapcores/community:latest
 
 ALPINE_EOF
@@ -298,6 +375,59 @@ log "Platform: $PLATFORM"
 DETECTED_OS="${PLATFORM%-*}"
 DETECTED_ARCH="${PLATFORM#*-}"
 
+# Bail out on Intel Mac BEFORE we fingerprint the host any further —
+# we don't ship a native binary for it. (Has to run in the parent
+# shell so its `exit 1` actually terminates the script.)
+detect_intel_mac_unsupported
+
+# perf-wave-10B: pick CPU vs CUDA tarball variant. detect_gpu() reads
+# the env override (SYNAPCORES_GPU={cpu,cuda}) first, then probes
+# nvidia-smi / libcuda.so.1.
+#
+# Track whether the GPU choice was set explicitly so we know whether to
+# offer the user an opt-out below. Env override = no prompt; auto-detect
+# = prompt the operator on a tty (a developer with a GPU box may still
+# want the smaller CPU build for a quick test of the default 1B model).
+if [ -n "${SYNAPCORES_GPU:-}" ]; then
+    GPU_AUTO_DETECTED=false
+else
+    GPU_AUTO_DETECTED=true
+fi
+detect_gpu
+log "GPU: $DETECTED_GPU"
+
+# Offer to fall back to the CPU build when CUDA was auto-detected.
+# Skipped when:
+#   - SYNAPCORES_GPU was set explicitly (operator already chose)
+#   - SYNAPCORES_NONINTERACTIVE=1 (CI / automation)
+#   - SYNAPCORES_BINARY_ONLY=1 (operator handling setup themselves)
+#   - stdin is not a tty / no /dev/tty available
+# Default answer = keep CUDA (preserves existing behavior).
+if [ "$DETECTED_GPU" = "cuda" ] && [ "$GPU_AUTO_DETECTED" = "true" ] \
+   && [ -z "${SYNAPCORES_NONINTERACTIVE:-}" ] && [ -z "$BINARY_ONLY" ] \
+   && [ -e /dev/tty ]; then
+    cat <<GPU_PROMPT
+[get-synapcores] NVIDIA GPU detected. Which build would you like?
+
+  1) CPU build   → smaller, no CUDA runtime deps. Fine for the
+                   default Llama-3.2-1B and quick testing.
+  2) CUDA build  → GPU-accelerated. Recommended for heavy LLM
+                   workloads / larger models.
+
+GPU_PROMPT
+    printf '\033[1;34m[get-synapcores]\033[0m Choose [1/2] (default 2): '
+    read -r GPU_ANSWER < /dev/tty || GPU_ANSWER="2"
+    case "$GPU_ANSWER" in
+        1|cpu|CPU)
+            DETECTED_GPU=cpu
+            log "Switched to CPU build (user choice)"
+            ;;
+        *)
+            : # keep CUDA
+            ;;
+    esac
+fi
+
 # DISTRO_TAG is meaningful only for Linux. macOS skips check_distro.
 DISTRO_TAG=""
 case "$PLATFORM" in
@@ -310,9 +440,57 @@ esac
 # Resolve version
 # ---------------------------------------------------------------------
 
-AUTO_RESOLVED=0
+# ---------------------------------------------------------------------
+# Resolve install mode (system vs user)
+# ---------------------------------------------------------------------
+#
+# Linux only. macOS already does a userland-style install (writes under
+# ~/.synapcores) regardless, so the prompt only matters for Linux where
+# the default is the sudo / /opt / systemd path.
+#
+# Honor SYNAPCORES_USER_INSTALL if set. Otherwise prompt when stdin is
+# a tty and SYNAPCORES_NONINTERACTIVE is unset; default = system mode.
+if [ "$DETECTED_OS" = "linux" ] && [ -z "$USER_INSTALL" ] \
+   && [ -z "${SYNAPCORES_NONINTERACTIVE:-}" ] && [ -z "$BINARY_ONLY" ] \
+   && [ -e /dev/tty ]; then
+    cat <<MODE_PROMPT
+[get-synapcores] How would you like to install?
+
+  1) System install  → /opt/synapcores + /etc/systemd unit  (requires sudo)
+                       Recommended for production / always-on use.
+  2) User install    → ~/.local/bin + ~/.synapcores         (no sudo)
+                       Good for quickly testing the application.
+                       No system user, no service, foreground binary.
+
+MODE_PROMPT
+    printf '\033[1;34m[get-synapcores]\033[0m Choose [1/2] (default 1): '
+    read -r MODE_ANSWER < /dev/tty || MODE_ANSWER="1"
+    case "$MODE_ANSWER" in
+        2|user|U|u) USER_INSTALL=1 ;;
+        *)          USER_INSTALL="" ;;
+    esac
+fi
+
+# Resolve INSTALL_PREFIX now that USER_INSTALL is settled.
+if [ -z "$INSTALL_PREFIX" ]; then
+    if [ -n "$USER_INSTALL" ]; then
+        INSTALL_PREFIX="${HOME}/.local/bin"
+    else
+        INSTALL_PREFIX="/usr/local/bin"
+    fi
+fi
+
+if [ -n "$USER_INSTALL" ]; then
+    log "Install mode: user (binary → ${INSTALL_PREFIX}, no sudo)"
+    # Make sure the binary dir exists. ~/.local/bin is the XDG default
+    # and is on PATH on most modern distros via ~/.profile, but it's
+    # not guaranteed to exist on a fresh user account.
+    mkdir -p "$INSTALL_PREFIX"
+else
+    log "Install mode: system (binary → ${INSTALL_PREFIX}, requires sudo)"
+fi
+
 if [ -z "$PINNED_VERSION" ]; then
-    AUTO_RESOLVED=1
     log "Resolving latest release..."
     # IMPORTANT: no -L. With -L, curl follows the redirect and
     # %{redirect_url} comes back empty. We need GitHub's 302 Location
@@ -332,58 +510,38 @@ log "Version: $PINNED_VERSION"
 # DISTRO_TAG is "" on Ubuntu 22.04 / Debian 12 / macOS / unknown distros
 # (FFmpeg 4 / native Mac tarball) and "-ubuntu24" on Ubuntu 24.04 / Debian 13
 # (FFmpeg 6 tarball variant). Set by check_distro() above.
-TARBALL="synapcores-ce-${PINNED_VERSION}-${PLATFORM}${DISTRO_TAG}.tar.gz"
+#
+# perf-wave-10B: GPU_TAG is "-cuda" when DETECTED_GPU=cuda (libcuda
+# present or explicit override) and "" otherwise. The CUDA variant is
+# only published for linux-x86_64; detect_gpu() already short-circuits
+# to "cpu" elsewhere, so this concat is safe everywhere.
+GPU_TAG=""
+if [ "$DETECTED_GPU" = "cuda" ]; then
+    GPU_TAG="-cuda"
+
+    # Not every release ships a CUDA tarball — the linux-x86_64-cuda
+    # build OOM-kills the 16 GB GitHub-hosted runner during the LTO
+    # link step (see release-ce.yml note on CARGO_PROFILE_RELEASE_LTO).
+    # When the GPU choice was auto-detected, probe the release asset
+    # before committing to the CUDA tarball; on 404, fall back to CPU.
+    # An explicit SYNAPCORES_GPU=cuda override is honored — we let the
+    # download fail loudly so the operator notices instead of silently
+    # getting a CPU binary.
+    if [ "$GPU_AUTO_DETECTED" = "true" ]; then
+        CUDA_TARBALL="synapcores-ce-${PINNED_VERSION}-${PLATFORM}${DISTRO_TAG}-cuda.tar.gz"
+        CUDA_URL="${RELEASE_BASE}/download/${PINNED_VERSION}/${CUDA_TARBALL}"
+        if curl -sfI "$CUDA_URL" >/dev/null 2>&1; then
+            log "CUDA tarball confirmed for ${PINNED_VERSION}"
+        else
+            warn "CUDA tarball not published for ${PINNED_VERSION} — falling back to CPU build"
+            DETECTED_GPU=cpu
+            GPU_TAG=""
+        fi
+    fi
+fi
+TARBALL="synapcores-ce-${PINNED_VERSION}-${PLATFORM}${DISTRO_TAG}${GPU_TAG}.tar.gz"
 TARBALL_URL="${RELEASE_BASE}/download/${PINNED_VERSION}/${TARBALL}"
 CHECKSUM_URL="${TARBALL_URL}.sha256"
-
-# "alias to latest available": GitHub's release `latest` is global, not
-# per-platform. If the resolved latest release has no binary for THIS platform
-# (e.g. a Linux-only release), fall back to the newest release that does — so
-# Mac/ARM users always get the latest *available* build instead of a 404.
-# Only when the version was auto-resolved; a pinned $SYNAPCORES_VERSION fails loud.
-asset_exists() { curl -fsSL -r 0-0 -o /dev/null "$1" 2>/dev/null; }
-if [ "$AUTO_RESOLVED" = "1" ] && ! asset_exists "$TARBALL_URL"; then
-    warn "No ${PLATFORM}${DISTRO_TAG} binary in ${PINNED_VERSION}; finding the latest release that has one..."
-    _found=0
-    _tags=$(curl -fsSL "https://api.github.com/repos/${GITHUB_REPO}/releases?per_page=20" 2>/dev/null \
-              | grep '"tag_name":' | sed -E 's/.*"tag_name":[[:space:]]*"([^"]+)".*/\1/')
-    for _t in $_tags; do
-        _cand="synapcores-ce-${_t}-${PLATFORM}${DISTRO_TAG}.tar.gz"
-        _url="${RELEASE_BASE}/download/${_t}/${_cand}"
-        if asset_exists "$_url"; then
-            log "Using ${_t} — latest release with a ${PLATFORM}${DISTRO_TAG} binary."
-            PINNED_VERSION="$_t"
-            TARBALL="$_cand"
-            TARBALL_URL="$_url"
-            CHECKSUM_URL="${_url}.sha256"
-            _found=1
-            break
-        fi
-    done
-    [ "$_found" = "1" ] || fail "no ${PLATFORM}${DISTRO_TAG} binary in recent releases — run via Docker instead: docker run -d -p 8080:8080 synapcores/community:latest"
-fi
-
-# ---------------------------------------------------------------------
-# Anonymous install counter ping (no PII, opt-out via COUNTER_OPT_OUT=1)
-# ---------------------------------------------------------------------
-# Fires a single GET to the install-counter endpoint right after we've
-# resolved the platform + version and committed to an install — but
-# BEFORE the download starts. This is how we count installs by OS/arch/
-# version. Until this existed, Linux + Windows installs were invisible
-# (curl-pipe-sh leaves no trace on GitHub Pages); the binary download
-# itself is counted on GitHub Releases for Linux/Windows users via this
-# path. Total bytes added to the network footprint: < 200 bytes.
-#
-# No personal data is sent — just the platform string and version tag,
-# both already public (they're literally in the tarball URL above).
-# 5-second timeout. `|| true` means: if the counter is down, the
-# install still proceeds. We never block on telemetry.
-#
-# Set COUNTER_OPT_OUT=1 in your environment to skip the ping entirely.
-if [ -z "${COUNTER_OPT_OUT:-}" ]; then
-    _counter_url="https://synapcores.com/api/install-counter?v=${PINNED_VERSION}&os=${DETECTED_OS}&arch=${DETECTED_ARCH}&channel=cli"
-    curl -fsSL --max-time 5 -o /dev/null "$_counter_url" 2>/dev/null || true
-fi
 
 WORK_DIR=$(mktemp -d)
 trap 'rm -rf "$WORK_DIR"' EXIT INT TERM
@@ -431,64 +589,90 @@ fi
 # Install binary
 # ---------------------------------------------------------------------
 
-# v1.6.4.1 fix: on Apple Silicon Macs /usr/local/bin doesn't exist by
-# default (Homebrew lives at /opt/homebrew/bin there). When the user
-# hasn't pinned SYNAPCORES_PREFIX, prefer the Homebrew bin dir if
-# it's present so the binary lands inside the user's existing $PATH.
-# Falls back to /usr/local/bin only if Homebrew isn't there. Intel
-# Macs and Linux keep the original /usr/local/bin default since
-# that's where their Homebrew lives too (Intel) or always exists
-# (most Linux distros).
-if [ -z "${SYNAPCORES_PREFIX:-}" ] \
-   && [ "$DETECTED_OS" = "darwin" ] \
-   && [ "$DETECTED_ARCH" = "aarch64" ] \
-   && [ -d /opt/homebrew/bin ]; then
-    INSTALL_PREFIX="/opt/homebrew/bin"
-    log "Apple Silicon detected with Homebrew; using ${INSTALL_PREFIX}"
-fi
-
 # POSIX sh has no $EUID — use `id -u`. Also POSIX has no arrays, so we
 # use SUDO_PREFIX as a (possibly empty) string that is word-split into
 # argv when the install command runs.
-if [ "$(id -u)" -eq 0 ]; then
+#
+# User mode never needs sudo — the binary lands in the user's own
+# ~/.local/bin (or whatever they set via SYNAPCORES_PREFIX).
+if [ -n "$USER_INSTALL" ] || [ "$(id -u)" -eq 0 ]; then
     SUDO_PREFIX=""
 else
     log "Installing to ${INSTALL_PREFIX} requires sudo..."
     SUDO_PREFIX="sudo"
 fi
 
-# v1.6.4.1 fix: ensure the install directory exists before invoking
-# install(1). On a fresh Apple Silicon Mac /usr/local/bin doesn't exist
-# yet, which made BSD install fail with the cryptic
-#   "install: /usr/local/bin/INS@<random>: No such file or directory"
-# error — INS@* is the BSD-install atomic-rename tempfile, and it
-# can't be created in a directory that doesn't exist.
-# shellcheck disable=SC2086
-$SUDO_PREFIX mkdir -p "$INSTALL_PREFIX" \
-    || fail "could not create ${INSTALL_PREFIX} (need write or sudo)"
-
 # shellcheck disable=SC2086
 $SUDO_PREFIX install -m 0755 "$BINARY_SRC" "${INSTALL_PREFIX}/synapcores" \
     || fail "binary install failed"
 log "Installed: ${INSTALL_PREFIX}/synapcores"
 
-# v1.6.4.1: surface the PATH hint when we installed somewhere that
-# isn't already on the user's PATH. Saves the next 60 seconds of
-# "synapcores: command not found" frustration.
-case ":${PATH}:" in
-    *":${INSTALL_PREFIX}:"*) ;; # already on PATH
-    *)
-        cat >&2 <<PATH_HINT_EOF
+# ONNX Runtime is loaded relative to the installed executable. Preserve it
+# before WORK_DIR is deleted, including macOS, user and binary-only installs.
+# Existing tarballs without an ONNX manifest keep their previous capability;
+# a new manifest with missing runtime/attribution is a broken package.
+ONNX_PACKAGE_DIR="$(dirname "$BINARY_SRC")"
+if [ -f "${ONNX_PACKAGE_DIR}/onnx-runtime-manifest.json" ]; then
+    case "$DETECTED_OS" in
+        linux) ONNX_LIBRARY_NAME="libonnxruntime.so" ;;
+        darwin) ONNX_LIBRARY_NAME="libonnxruntime.dylib" ;;
+    esac
+    ONNX_RUNTIME_DIR="${INSTALL_PREFIX}/lib/synapcores"
+    ONNX_NOTICE_DIR="${INSTALL_PREFIX}/share/synapcores/licenses/onnxruntime"
+    [ -r "${ONNX_PACKAGE_DIR}/lib/${ONNX_LIBRARY_NAME}" ] \
+        || fail "ONNX package is missing ${ONNX_LIBRARY_NAME}"
+    for ONNX_NOTICE in LICENSE ThirdPartyNotices.txt VERSION_NUMBER; do
+        [ -r "${ONNX_PACKAGE_DIR}/licenses/onnxruntime/${ONNX_NOTICE}" ] \
+            || fail "ONNX package is missing native attribution: ${ONNX_NOTICE}"
+    done
+    # shellcheck disable=SC2086
+    $SUDO_PREFIX mkdir -p "$ONNX_RUNTIME_DIR" "$ONNX_NOTICE_DIR" \
+        || fail "cannot create ONNX runtime install directories"
+    # macOS loader dependencies/symlink targets travel as one runtime folder.
+    if [ "$DETECTED_OS" = darwin ]; then
+        $SUDO_PREFIX cp -R "${ONNX_PACKAGE_DIR}/lib/." "$ONNX_RUNTIME_DIR/" \
+            || fail "macOS runtime folder install failed"
+    fi
+    for ONNX_LIBRARY in "${ONNX_PACKAGE_DIR}"/lib/libonnxruntime*.so* "${ONNX_PACKAGE_DIR}"/lib/libonnxruntime*.dylib; do
+        [ -f "$ONNX_LIBRARY" ] || continue
+        # shellcheck disable=SC2086
+        $SUDO_PREFIX install -m 0644 "$ONNX_LIBRARY" "${ONNX_RUNTIME_DIR}/$(basename "$ONNX_LIBRARY")" \
+            || fail "ONNX runtime library install failed"
+    done
+    for ONNX_NOTICE in LICENSE ThirdPartyNotices.txt VERSION_NUMBER; do
+        # shellcheck disable=SC2086
+        $SUDO_PREFIX install -m 0644 "${ONNX_PACKAGE_DIR}/licenses/onnxruntime/${ONNX_NOTICE}" "${ONNX_NOTICE_DIR}/${ONNX_NOTICE}" \
+            || fail "ONNX runtime attribution install failed"
+    done
+    # shellcheck disable=SC2086
+    $SUDO_PREFIX install -m 0644 "${ONNX_PACKAGE_DIR}/onnx-runtime-manifest.json" "${ONNX_RUNTIME_DIR}/onnx-runtime-manifest.json" \
+        || fail "ONNX runtime provenance install failed"
+    log "Installed CPU ONNX runtime: ${ONNX_RUNTIME_DIR}/${ONNX_LIBRARY_NAME}"
+fi
 
-[get-synapcores] ${INSTALL_PREFIX} is not on your \$PATH. Add it
-with:
+# The checksum-verified package carries the platform startup helper. It is
+# installed beside the executable for relocatable foreground/launchd/systemd use.
+START_HELPER_SRC="${ONNX_PACKAGE_DIR}/synapcores-start.sh"
+if [ -f "$START_HELPER_SRC" ]; then
+    $SUDO_PREFIX install -m 0755 "$START_HELPER_SRC" "${INSTALL_PREFIX}/synapcores-start" \
+        || fail "startup helper install failed"
+fi
 
-    export PATH="${INSTALL_PREFIX}:\$PATH"
-
-(append the same line to ~/.zshrc or ~/.bashrc to make it permanent).
-PATH_HINT_EOF
-        ;;
-esac
+# In user mode, warn if the install dir isn't on PATH. ~/.local/bin is
+# included by ~/.profile on most modern distros, but only after the
+# next login — so a fresh-from-`useradd` account might not see it yet.
+if [ -n "$USER_INSTALL" ]; then
+    case ":${PATH}:" in
+        *":${INSTALL_PREFIX}:"*)
+            : # already on PATH
+            ;;
+        *)
+            warn "${INSTALL_PREFIX} is not on your PATH for this shell."
+            warn "Run synapcores via its full path, or add to your shell rc:"
+            warn "  export PATH=\"${INSTALL_PREFIX}:\$PATH\""
+            ;;
+    esac
+fi
 
 # ---------------------------------------------------------------------
 # Verify install (deferred on both OSes)
@@ -602,10 +786,17 @@ if [ "$DETECTED_OS" = "darwin" ]; then
     # ----- Drop default config + data dir -----
     SC_HOME="${HOME}/.synapcores"
     SC_CONFIG="${SC_HOME}/gateway.toml"
-    SC_DATA_DIR="${SC_HOME}/data"
+    SC_DATA_DIR="${AIDB_DATA_DIR:-${SC_HOME}/data}"
+    case "$SC_DATA_DIR" in
+        /*) ;;
+        *) fail "AIDB_DATA_DIR must be an absolute path for installation" ;;
+    esac
     SC_MODELS_DIR="${SC_HOME}/models/text"
 
     mkdir -p "$SC_HOME" "$SC_DATA_DIR" "$SC_MODELS_DIR"
+    chmod 700 "$SC_HOME"
+    START_HELPER="${INSTALL_PREFIX}/synapcores-start"
+    [ -x "$START_HELPER" ] || fail "release is missing synapcores-start.sh; install a complete current release folder"
 
     # The bundled template (v1.3.1+) lives next to the binary in the
     # extracted tarball. Older tarballs don't have it, so fall through
@@ -619,13 +810,19 @@ if [ "$DETECTED_OS" = "darwin" ]; then
         # under the user's home (the template defaults to
         # /opt/synapcores/aidb_data, which would need root and isn't
         # the macOS convention).
-        sed "s|^data_dir = .*|data_dir = \"${SC_DATA_DIR}\"|" \
-            "$BUNDLED_TEMPLATE" \
-            > "$SC_CONFIG"
+        SC_DATA_TOML=$(printf %s "$SC_DATA_DIR" | sed 's/\\/\\\\/g; s/"/\\"/g')
+        while IFS= read -r template_line || [ -n "$template_line" ]; do
+            case "$template_line" in
+                data_dir\ =*) printf 'data_dir = "%s"\n' "$SC_DATA_TOML" ;;
+                *) printf '%s\n' "$template_line" ;;
+            esac
+        done < "$BUNDLED_TEMPLATE" > "$SC_CONFIG"
         log "Wrote default config to ${SC_CONFIG}"
     else
         warn "No config template bundled (older tarball?). Generating minimal config."
+        SC_DATA_TOML=$(printf %s "$SC_DATA_DIR" | sed 's/\\/\\\\/g; s/"/\\"/g')
         cat >"$SC_CONFIG" <<MIN_CFG
+data_dir = "${SC_DATA_TOML}"
 [server]
 listen_addr     = "127.0.0.1:8080"
 max_body_size   = 1073741824
@@ -634,7 +831,6 @@ max_body_size   = 1073741824
 # The Docker image has used 300 for this reason.
 request_timeout = 300
 enable_cors     = true
-data_dir = "${SC_DATA_DIR}"
 
 [auth]
 enabled          = true
@@ -642,21 +838,19 @@ token_expiration = 86400
 
 [query]
 max_concurrent_queries = 32
-# 5 minutes. 30000 (30 s) was the value the engine deliberately moved away from
-# in v1.6.5: a cold GENERATE on a CPU-only host takes ~2 minutes, so LLM-backed
-# SQL (GENERATE, AGENT_RUN, NL2SQL) failed with "Operation timeout" out of the
-# box. Lower it deliberately if you want fail-fast OLTP behaviour.
+# 5 minutes, matching the engine's own default. This template used to write
+# 30000 (30 s) — the value the engine deliberately moved AWAY from in v1.6.5 —
+# so every install that followed this file got a stricter timeout than an
+# install with no config at all. On a CPU-only host a cold GENERATE takes ~2
+# minutes, so LLM-backed SQL (GENERATE, AGENT_RUN, NL2SQL) failed with
+# "Operation timeout" out of the box. OLTP callers that want fail-fast should
+# lower this deliberately rather than inherit it by accident.
 default_timeout_ms     = 300000
 
 [query.ai_service]
-# Same stack as install-ce.sh and the Docker image. v1.8.0-ce moved the default
-# from `native` (filesystem-resolved GGUF) to `local` (in-process model registry),
-# and qwen2.5-coder:7b is the model the engine is verified against for AGENT_RUN
-# tool-call JSON and the recipe builder. A <=1B model is materially weaker at both.
 provider        = "local"
 model           = "qwen2.5-coder:7b"
 embedding_model = "all-minilm:latest"
-# Lets the gateway self-heal a missing model on first use.
 auto_pull       = true
 
 [ai_cache]
@@ -669,111 +863,146 @@ MIN_CFG
         log "Wrote minimal config to ${SC_CONFIG}"
     fi
 
-    # ----- Offer to pre-pull the default LLM (registry) -----
-    # Acquisition goes through `synapcores pull` (registry.ollama.ai) to match
-    # install-ce.sh and the Docker image. The old path curl'd a 700 MB GGUF
-    # straight from HuggingFace for a model nothing else in the product used.
-    DEFAULT_MODEL="qwen2.5-coder:7b"
+    # Use the engine's own resolver for existing custom data_dir configurations.
+    SC_DATA_DIR="$("${INSTALL_PREFIX}/synapcores" --config "$SC_CONFIG" models data-dir)" \
+        || fail "Cannot resolve the configured data directory"
+    mkdir -p "$SC_DATA_DIR"
 
-    if [ -n "${SYNAPCORES_NO_MODEL_DOWNLOAD:-}" ]; then
-        log "SYNAPCORES_NO_MODEL_DOWNLOAD set; skipping the model pull."
-        log "auto_pull = true in the config fetches it on first EMBED / GENERATE."
+    # ----- Offer to pre-pull the default model from the native registry -----
+    #
+    # v1.8.x ships its own OCI registry client that pulls GGUF + chat
+    # template + params blobs from registry.ollama.ai into the data
+    # dir's content-addressed store. The gateway.toml above sets
+    # auto_pull = true so first-use works regardless — pre-pulling
+    # just front-loads the ~4.4 GB download into the install step.
+    DEFAULT_MODEL="qwen2.5-coder:7b"
+    INSTALLED_BIN="${INSTALL_PREFIX}/synapcores"
+
+    # Existing models belong to the operator. Upgrades never delete legacy
+    # GGUFs or imported bundles; migrations can retain their explicit paths.
+
+    if [ ! -x "$INSTALLED_BIN" ]; then
+        warn "installed binary not found at ${INSTALLED_BIN}; skipping pre-pull."
+        warn "warm-on-boot + auto_pull = true in gateway.toml will pull on first start."
+    elif [ -n "${SYNAPCORES_NO_MODEL_DOWNLOAD:-}" ]; then
+        log "SYNAPCORES_NO_MODEL_DOWNLOAD set; skipping pre-pull."
+        log "warm-on-boot + auto_pull = true in gateway.toml will pull on first start."
     else
         if [ -n "${SYNAPCORES_NONINTERACTIVE:-}" ]; then
-            log "Non-interactive: pre-pulling ${DEFAULT_MODEL}..."
+            log "Non-interactive: pre-pulling default LLM..."
             DL_ANSWER="y"
         elif [ ! -t 0 ] && [ ! -e /dev/tty ]; then
-            warn "Cannot prompt for the model pull (no tty). Skipping."
-            warn "auto_pull = true means the first EMBED / GENERATE fetches it."
+            warn "Cannot prompt for LLM pre-pull (no tty). Skipping."
+            warn "Pull manually later:  ${INSTALLED_BIN} pull ${DEFAULT_MODEL}"
             DL_ANSWER="n"
         else
-            printf '\033[1;34m[get-synapcores]\033[0m Pre-pull default LLM (%s, ~4.4GB)? [Y/n] ' "$DEFAULT_MODEL"
+            printf '\033[1;34m[get-synapcores]\033[0m Pre-pull default LLM (qwen2.5-coder:7b, ~4.4GB) from registry.ollama.ai? [Y/n] '
             read -r DL_ANSWER < /dev/tty || DL_ANSWER="n"
         fi
 
         case "$DL_ANSWER" in
             ""|[Yy]*)
-                log "Pulling ${DEFAULT_MODEL} (this can take a while)..."
-                if AIDB_ACCEPT_LICENSE=1 "${INSTALL_PREFIX}/synapcores" pull "$DEFAULT_MODEL"; then
-                    log "  ✓ ${DEFAULT_MODEL} installed"
+                log "Running: ${INSTALLED_BIN} pull ${DEFAULT_MODEL}"
+                if AIDB_DATA_DIR="$SC_DATA_DIR" "$INSTALLED_BIN" --config "$SC_CONFIG" pull "$DEFAULT_MODEL"; then
+                    log "  ✓ ${DEFAULT_MODEL} pulled into the registry blob store"
                 else
-                    warn "Pull failed. The engine will retry on first use (auto_pull = true)."
-                    warn "Or run it yourself:  ${INSTALL_PREFIX}/synapcores pull ${DEFAULT_MODEL}"
+                    warn "pull failed; the gateway's auto_pull will retry on first use."
                 fi
                 ;;
             *)
-                log "Skipped — the engine pulls on first use (auto_pull = true)."
-                log "Pre-pull later:          ${INSTALL_PREFIX}/synapcores pull ${DEFAULT_MODEL}"
-                log "Smaller box? try:        ${INSTALL_PREFIX}/synapcores pull tinyllama:latest"
-                log "                         then set model = \"tinyllama:latest\" in ${SC_CONFIG}"
+                log "Skipped. The engine will pull on first use (auto_pull = true). To pre-pull later:"
+                log "  ${INSTALLED_BIN} pull ${DEFAULT_MODEL}"
+                log "Or edit ${SC_CONFIG} [query.ai_service] to switch to OpenAI / Anthropic / Ollama."
                 ;;
         esac
     fi
 
-    # ----- Credential-encryption key for the data lake -----
-    # Without this the gateway still starts, but logs
-    #   "Data lake failed to start: AIDB_ENCRYPTION_KEY is not set"
-    # and every /v1/lake/* call answers 503. There is deliberately no config key
-    # for it, so it has to be an environment variable. It must stay STABLE: it
-    # encrypts stored object-store credentials, and changing it makes them
-    # undecryptable.
-    SC_ENV_FILE="${SC_HOME}/synapcores.env"
-    if [ -f "$SC_ENV_FILE" ] && grep -q "AIDB_ENCRYPTION_KEY" "$SC_ENV_FILE" 2>/dev/null; then
-        log "Reusing existing secrets in ${SC_ENV_FILE}"
-    else
-        SC_ENC_KEY="$(openssl rand -base64 32 2>/dev/null || head -c 32 /dev/urandom | base64)"
-        SC_JWT_SECRET="$(openssl rand -base64 32 2>/dev/null || head -c 32 /dev/urandom | base64)"
-        umask 077
-        cat >"$SC_ENV_FILE" <<ENV_EOF
-# SynapCores runtime secrets — generated by get.synapcores.com
-# Keep these STABLE across restarts. AIDB_ENCRYPTION_KEY encrypts stored data
-# lake credentials; changing it makes existing ones undecryptable.
-export AIDB_JWT_SECRET="${SC_JWT_SECRET}"
-export AIDB_ENCRYPTION_KEY="${SC_ENC_KEY}"
-export AIDB_MODELS_DIR="${SC_MODELS_DIR}"
-ENV_EOF
-        chmod 600 "$SC_ENV_FILE"
-        log "Wrote secrets to ${SC_ENV_FILE} (mode 600)"
+    if [ -z "${SYNAPCORES_WITH_NLI:-}" ] && [ -t 0 ] && [ -e /dev/tty ] \
+        && [ -z "${SYNAPCORES_NONINTERACTIVE:-}" ]; then
+        printf '\033[1;34m[get-synapcores]\033[0m Enable semantic verification (NLI, ~577 MB)? [y/N] '
+        read -r NLI_ANSWER < /dev/tty || NLI_ANSWER=n
+        case "$NLI_ANSWER" in [Yy]*) NLI_OPT_IN=1 ;; esac
     fi
+    if [ "$NLI_OPT_IN" = 1 ]; then
+        log "Installing semantic verification (${NLI_MODEL})..."
+        if [ -z "${SYNAPCORES_NO_MODEL_DOWNLOAD:-}" ]; then
+            AIDB_DATA_DIR="$SC_DATA_DIR" "$INSTALLED_BIN" --config "$SC_CONFIG" pull "$NLI_MODEL" \
+                || fail "NLI download failed; re-run with SYNAPCORES_WITH_NLI=1 to resume"
+        fi
+        AIDB_DATA_DIR="$SC_DATA_DIR" "$INSTALLED_BIN" --config "$SC_CONFIG" models enable-nli "$NLI_MODEL" \
+            || fail "NLI requires a complete installed/imported bundle"
+        log "NLI enabled. Start/restart the gateway; GET /v1/ai/nli/models reports actual readiness."
+    fi
+
+    # Add only missing settings; keep existing secrets/model/runtime choices.
+    # The launchd agent invokes the helper, which reads this private file on
+    # every launch. Secret values are never copied into the XML or logs.
+    SC_ENV_FILE="${SC_HOME}/synapcores.env"
+    "$START_HELPER" --prepare-env --env-file "$SC_ENV_FILE" \
+        --models-dir "$SC_MODELS_DIR" \
+        --runtime "${INSTALL_PREFIX}/lib/synapcores/libonnxruntime.dylib" \
+        || fail "could not prepare private runtime environment"
+    SC_PLIST="${HOME}/Library/LaunchAgents/com.synapcores.gateway.plist"
+    "$START_HELPER" --write-launchd --binary "$INSTALLED_BIN" --config "$SC_CONFIG" \
+        --env-file "$SC_ENV_FILE" --plist "$SC_PLIST" \
+        || fail "could not prepare launchd agent"
+    log "Prepared private environment and launchd agent; no service was loaded or started."
 
     cat <<MAC_FINISH_EOF
 
 [get-synapcores] Done — start the gateway
 
-  source ${SC_ENV_FILE}
-  ${INSTALL_PREFIX}/synapcores --config ${SC_CONFIG}
-
-  ${SC_ENV_FILE} holds AIDB_JWT_SECRET, AIDB_ENCRYPTION_KEY and
-  AIDB_MODELS_DIR. Source it on every start, and keep the file: the
-  encryption key protects stored data-lake credentials, so if it changes
-  those credentials can no longer be read. Without it the gateway still
-  starts, but logs "Data lake failed to start" and /v1/lake/* returns 503.
+  "${START_HELPER}" --env-file "${SC_ENV_FILE}" --binary "${INSTALLED_BIN}" --config "${SC_CONFIG}"
 
 The first start prints an admin password — capture it from the log
 output. Then open the Web UI at http://localhost:8080/
 
-(Optional) auto-start via launchd:
-  https://docs.synapcores.com/macos/#launchd-setup
+(Optional) start the prepared launchd agent:
+  launchctl bootstrap "gui/$(id -u)" "${SC_PLIST}"
+  launchctl print "gui/$(id -u)/com.synapcores.gateway"
+
+A fatal start stops without an automatic restart loop. Inspect private logs under
+${SC_HOME}/logs, fix the error, then start again deliberately. The helper checks
+configured HTTP/HTTPS ports before launching; it never stops their current owner.
 
 MAC_FINISH_EOF
     exit 0
 fi
 
-# Linux path: fetch and run install-ce.sh (creates synapcores user,
-# /opt/synapcores layout, systemd unit). install-ce.sh is allowed to
-# use bash — it's saved to disk first, so its shebang is honored. Only
-# THIS bootstrap has to be POSIX-clean.
+# Linux path: fetch and run install-ce.sh.
+#   - System mode: needs sudo. Creates synapcores user, /opt/synapcores
+#     layout, systemd unit at /etc/systemd/system/.
+#   - User mode:   no sudo. ~/.synapcores layout, no system user, no
+#     systemd unit (foreground binary).
+# install-ce.sh is allowed to use bash — it's saved to disk first, so
+# its shebang is honored. Only THIS bootstrap has to be POSIX-clean.
 INSTALLER_URL="${RELEASE_BASE}/download/${PINNED_VERSION}/install-ce.sh"
 INSTALLER="${WORK_DIR}/install-ce.sh"
 
 log "Fetching system installer..."
 if curl -fsSL "$INSTALLER_URL" -o "$INSTALLER" 2>/dev/null; then
     chmod +x "$INSTALLER"
-    if [ "$(id -u)" -eq 0 ]; then
-        "$INSTALLER" --binary "${INSTALL_PREFIX}/synapcores"
+    set -- "$INSTALLER" --binary "${INSTALL_PREFIX}/synapcores"
+    if [ "$NLI_OPT_IN" = 1 ]; then
+        set -- "$@" --with-nli --nli-model "$NLI_MODEL"
+    fi
+    if [ -n "$USER_INSTALL" ]; then
+        log "Running install-ce.sh --user (no sudo)..."
+        set -- "$@" --user
+    fi
+    # Pass only installer controls across sudo; do not forward the caller's
+    # unrelated environment. The model itself is pulled by the service user.
+    set -- env "SYNAPCORES_WITH_NLI=${SYNAPCORES_WITH_NLI:-}" \
+        "SYNAPCORES_NO_MODEL_DOWNLOAD=${SYNAPCORES_NO_MODEL_DOWNLOAD:-}" \
+        "SYNAPCORES_NONINTERACTIVE=${SYNAPCORES_NONINTERACTIVE:-}" "$@"
+    if [ -n "${AIDB_DATA_DIR:-}" ]; then
+        set -- env "AIDB_DATA_DIR=$AIDB_DATA_DIR" "$@"
+    fi
+    if [ -n "$USER_INSTALL" ] || [ "$(id -u)" -eq 0 ]; then
+        "$@"
     else
         log "System setup requires sudo..."
-        sudo "$INSTALLER" --binary "${INSTALL_PREFIX}/synapcores"
+        sudo "$@"
     fi
 else
     warn "system installer not found at $INSTALLER_URL"
