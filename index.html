@@ -504,6 +504,19 @@ fi
 log "Version: $PINNED_VERSION"
 
 # ---------------------------------------------------------------------
+# Anonymous install counter ping (no PII, opt-out via COUNTER_OPT_OUT=1)
+# ---------------------------------------------------------------------
+# One fire-and-forget GET after platform + version are resolved and
+# before the download starts. curl-pipe-sh leaves no trace on GitHub
+# Pages, so this is the only way we can count CLI installs. Sends only
+# the version tag, OS and arch (already public in the tarball URL).
+# 5-second timeout; `|| true` means a down counter never blocks install.
+if [ -z "${COUNTER_OPT_OUT:-}" ]; then
+    _counter_url="https://synapcores.com/api/install-counter?v=${PINNED_VERSION}&os=${DETECTED_OS}&arch=${DETECTED_ARCH}&channel=cli"
+    curl -fsSL --max-time 5 -o /dev/null "$_counter_url" 2>/dev/null || true
+fi
+
+# ---------------------------------------------------------------------
 # Download
 # ---------------------------------------------------------------------
 
