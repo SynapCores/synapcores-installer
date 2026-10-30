@@ -30,6 +30,7 @@
 #   SYNAPCORES_WITH_NLI=1      Install and enable semantic verification.
 #   SYNAPCORES_NLI_MODEL=...   Curated alias (default nli-default; nli-xsmall optional).
 #   SYNAPCORES_NO_MODEL_DOWNLOAD=1  Use previously imported models, without pulling.
+#   AIDB_GPU_LAYERS=0          Persist an explicit CPU override; unset selects automatically.
 #
 # Written in POSIX sh on purpose: when invoked via `curl ... | sh`,
 # Debian/Ubuntu's /bin/sh is dash, not bash. Bash-only constructs like
@@ -132,51 +133,18 @@ detect_platform() {
     printf '%s-%s\n' "$DETECTED_OS" "$DETECTED_ARCH"
 }
 
-# perf-wave-10B: detect_gpu — pick between CPU and CUDA tarball variants.
-#
-# Sets DETECTED_GPU to "cpu" or "cuda". Override via SYNAPCORES_GPU env
-# var:
-#   SYNAPCORES_GPU=cpu  curl ... | sh   (force CPU even on a GPU host)
-#   SYNAPCORES_GPU=cuda curl ... | sh   (skip detection, demand CUDA)
-#
-# CUDA variant is published only for linux-x86_64. macOS / aarch64
-# always resolve to "cpu" — Apple Silicon uses Metal (separate codepath),
-# and we don't ship aarch64 CUDA tarballs.
-detect_gpu() {
-    DETECTED_GPU=cpu
-
-    # Allow explicit override before we run any detection.
-    if [ -n "${SYNAPCORES_GPU:-}" ]; then
-        DETECTED_GPU="$SYNAPCORES_GPU"
-        log "GPU override: SYNAPCORES_GPU=${SYNAPCORES_GPU}"
-        return
+# CPU and GPU hosts download the same artifact. Backend discovery belongs to the
+# runtime; an installer-side nvidia-smi probe cannot prove usable native offload.
+# Keep the old CPU preference as an explicit runtime override for upgrades.
+configure_gpu_override() {
+    case "${SYNAPCORES_GPU:-auto}" in
+        auto|cuda) ;;
+        cpu) [ -n "${AIDB_GPU_LAYERS:-}" ] || export AIDB_GPU_LAYERS=0 ;;
+        *) fail "SYNAPCORES_GPU must be auto, cpu or cuda; releases use one runtime-selected artifact" ;;
+    esac
+    if [ "${AIDB_GPU_LAYERS+x}" = x ]; then
+        case "$AIDB_GPU_LAYERS" in ''|*[!0-9]*) fail "AIDB_GPU_LAYERS must be a nonnegative layer count" ;; esac
     fi
-
-    # No CUDA build for macOS or for aarch64 — Apple uses Metal, and
-    # we don't currently publish aarch64 CUDA tarballs.
-    if [ "$DETECTED_OS" = "darwin" ]; then return; fi
-    if [ "$DETECTED_ARCH" = "aarch64" ]; then return; fi
-
-    # Primary signal: nvidia-smi works (driver is loaded + GPU visible).
-    if command -v nvidia-smi >/dev/null 2>&1; then
-        if nvidia-smi >/dev/null 2>&1; then
-            DETECTED_GPU=cuda
-            log "NVIDIA GPU detected via nvidia-smi"
-            return
-        fi
-    fi
-
-    # Fallback: libcuda.so.1 present (covers headless servers without
-    # nvidia-smi installed but with the runtime driver lib in place).
-    if [ -f /usr/lib/x86_64-linux-gnu/libcuda.so.1 ] \
-       || [ -f /usr/lib64/libcuda.so.1 ] \
-       || [ -f /usr/lib/libcuda.so.1 ]; then
-        DETECTED_GPU=cuda
-        log "CUDA runtime library (libcuda.so.1) detected"
-        return
-    fi
-
-    log "No CUDA detected — using CPU build"
 }
 
 # detect_intel_mac_unsupported: bail out on Intel Macs (no native binary
@@ -196,9 +164,10 @@ detect_intel_mac_unsupported() {
 published. Apple Silicon (M1/M2/M3/M4) Macs have a native binary
 available, but Intel Mac users should run via Docker:
 
+  mkdir -p "\$HOME/Documents/notes"
   docker run -p 8080:8080 -v synapcores-data:/var/lib/synapcores \\
-             -e AIDB_JWT_SECRET="\$(openssl rand -base64 32)" \\
-             -e AIDB_ENCRYPTION_KEY="\$(openssl rand -base64 32)" \\
+             -e AIDB_ACCEPT_LICENSE=1 \\
+             --mount "type=bind,source=\$HOME/Documents/notes,target=/data/docs,readonly" \\
              ghcr.io/synapcores/community:latest
 
 Apple discontinued Intel Macs in 2023 and the GitHub-hosted macos-13
@@ -217,13 +186,14 @@ INTEL_MAC_EOF
 # BEFORE downloading 50 MB of binary that won't link, AND select the
 # correct tarball variant via DISTRO_TAG.
 #
-# Two Linux tarball variants are published per architecture:
-#   - linux-{x86_64,aarch64}          built on Ubuntu 22.04 (FFmpeg 4 SONAMEs)
-#   - linux-{x86_64,aarch64}-ubuntu24 built on Ubuntu 24.04 (FFmpeg 6 SONAMEs)
+# ONE universal Linux tarball is published per architecture:
+#   - linux-{x86_64,aarch64}  built on Ubuntu 22.04 (glibc 2.35 floor), with the
+#     FFmpeg runtime BUNDLED in the tarball (issue #33) so it is self-contained
+#     and runs OOB regardless of the host's FFmpeg generation.
 #
-# DISTRO_TAG is "" for the 22.04 variant and "-ubuntu24" for the 24.04
-# variant. macOS sets DISTRO_TAG="" — the platform string already carries
-# the OS distinction (darwin-x86_64, darwin-aarch64).
+# DISTRO_TAG is therefore "" for every supported Linux distro (and macOS, whose
+# platform string already carries the OS). The former "-ubuntu24" variant was
+# consolidated away in v2.3.0-ce (Debian 13 is served this build provisionally).
 #
 # https://docs.synapcores.com/requirements/#supported-linux-distributions
 check_distro() {
@@ -242,9 +212,17 @@ check_distro() {
             log "Distro: ${PRETTY_NAME:-$ID $VERSION_ID} — supported (FFmpeg 4 build)."
             DISTRO_TAG=""
             ;;
-        ubuntu:24.04|debian:13)
-            log "Distro: ${PRETTY_NAME:-$ID $VERSION_ID} — supported (FFmpeg 6 build)."
-            DISTRO_TAG="-ubuntu24"
+        ubuntu:24.04)
+            log "Distro: ${PRETTY_NAME:-$ID $VERSION_ID} — supported (universal build; FFmpeg bundled)."
+            DISTRO_TAG=""
+            ;;
+        debian:13)
+            # v2.3.0-ce consolidation: the FFmpeg-6/Ubuntu-24.04 build was dropped.
+            # The universal glibc-2.35 build is self-contained (bundled FFmpeg) and
+            # runs on Debian 13 via glibc forward-compat. PROVISIONAL: Debian 13 is
+            # not yet in the CI installer smoke; formal validation lands next cycle.
+            warn "Debian 13: installing the universal native build (PROVISIONAL — full validation next release; Docker is the fully-supported path)."
+            DISTRO_TAG=""
             ;;
         debian:12)
             # Debian 12 (bookworm) ships FFmpeg 5.1.x with libavutil.so.57.
@@ -264,10 +242,11 @@ FFmpeg ABI, so the binary won't dynamically link.
 
 Run via Docker:
 
+  mkdir -p "\$HOME/Documents/notes"
   docker run -d --name synapcores -p 8080:8080 \\
              -v synapcores-data:/var/lib/synapcores \\
-             -e AIDB_JWT_SECRET="\$(openssl rand -base64 32)" \\
-             -e AIDB_ENCRYPTION_KEY="\$(openssl rand -base64 32)" \\
+             -e AIDB_ACCEPT_LICENSE=1 \\
+             --mount "type=bind,source=\$HOME/Documents/notes,target=/data/docs,readonly" \\
              ghcr.io/synapcores/community:latest
 
   docker logs -f synapcores | grep -A 7 FIRST-BOOT
@@ -289,9 +268,10 @@ Your system has glibc < 2.35 and the binary will not link.
 Options:
   1. Upgrade to Ubuntu 22.04 LTS or Debian 12.
   2. Run via Docker (works on any Linux):
+       mkdir -p "\$HOME/Documents/notes"
        docker run -p 8080:8080 -v synapcores-data:/var/lib/synapcores \\
-                  -e AIDB_JWT_SECRET="\$(openssl rand -base64 32)" \\
-                  -e AIDB_ENCRYPTION_KEY="\$(openssl rand -base64 32)" \\
+                  -e AIDB_ACCEPT_LICENSE=1 \\
+                  --mount "type=bind,source=\$HOME/Documents/notes,target=/data/docs,readonly" \\
                   ghcr.io/synapcores/community:latest
 
 Full distro matrix: https://docs.synapcores.com/requirements/#supported-linux-distributions
@@ -311,9 +291,10 @@ The CE matrix currently ships binaries for:
 
 Workarounds:
   1. Run via Docker (works on any Linux):
+       mkdir -p "\$HOME/Documents/notes"
        docker run -p 8080:8080 -v synapcores-data:/var/lib/synapcores \\
-                  -e AIDB_JWT_SECRET="\$(openssl rand -base64 32)" \\
-                  -e AIDB_ENCRYPTION_KEY="\$(openssl rand -base64 32)" \\
+                  -e AIDB_ACCEPT_LICENSE=1 \\
+                  --mount "type=bind,source=\$HOME/Documents/notes,target=/data/docs,readonly" \\
                   ghcr.io/synapcores/community:latest
 
   2. Use a supported distro in a VM or container.
@@ -347,9 +328,10 @@ DISTRO_RHEL_OLD_EOF
 [get-synapcores] Alpine Linux uses musl libc; the CE binary requires glibc.
 
 Use the Docker image (which is glibc-based) instead:
+  mkdir -p "\$HOME/Documents/notes"
   docker run -p 8080:8080 -v synapcores-data:/var/lib/synapcores \\
-             -e AIDB_JWT_SECRET="\$(openssl rand -base64 32)" \\
-             -e AIDB_ENCRYPTION_KEY="\$(openssl rand -base64 32)" \\
+             -e AIDB_ACCEPT_LICENSE=1 \\
+             --mount "type=bind,source=\$HOME/Documents/notes,target=/data/docs,readonly" \\
              ghcr.io/synapcores/community:latest
 
 ALPINE_EOF
@@ -380,53 +362,8 @@ DETECTED_ARCH="${PLATFORM#*-}"
 # shell so its `exit 1` actually terminates the script.)
 detect_intel_mac_unsupported
 
-# perf-wave-10B: pick CPU vs CUDA tarball variant. detect_gpu() reads
-# the env override (SYNAPCORES_GPU={cpu,cuda}) first, then probes
-# nvidia-smi / libcuda.so.1.
-#
-# Track whether the GPU choice was set explicitly so we know whether to
-# offer the user an opt-out below. Env override = no prompt; auto-detect
-# = prompt the operator on a tty (a developer with a GPU box may still
-# want the smaller CPU build for a quick test of the default 1B model).
-if [ -n "${SYNAPCORES_GPU:-}" ]; then
-    GPU_AUTO_DETECTED=false
-else
-    GPU_AUTO_DETECTED=true
-fi
-detect_gpu
-log "GPU: $DETECTED_GPU"
-
-# Offer to fall back to the CPU build when CUDA was auto-detected.
-# Skipped when:
-#   - SYNAPCORES_GPU was set explicitly (operator already chose)
-#   - SYNAPCORES_NONINTERACTIVE=1 (CI / automation)
-#   - SYNAPCORES_BINARY_ONLY=1 (operator handling setup themselves)
-#   - stdin is not a tty / no /dev/tty available
-# Default answer = keep CUDA (preserves existing behavior).
-if [ "$DETECTED_GPU" = "cuda" ] && [ "$GPU_AUTO_DETECTED" = "true" ] \
-   && [ -z "${SYNAPCORES_NONINTERACTIVE:-}" ] && [ -z "$BINARY_ONLY" ] \
-   && [ -e /dev/tty ]; then
-    cat <<GPU_PROMPT
-[get-synapcores] NVIDIA GPU detected. Which build would you like?
-
-  1) CPU build   → smaller, no CUDA runtime deps. Fine for the
-                   default Llama-3.2-1B and quick testing.
-  2) CUDA build  → GPU-accelerated. Recommended for heavy LLM
-                   workloads / larger models.
-
-GPU_PROMPT
-    printf '\033[1;34m[get-synapcores]\033[0m Choose [1/2] (default 2): '
-    read -r GPU_ANSWER < /dev/tty || GPU_ANSWER="2"
-    case "$GPU_ANSWER" in
-        1|cpu|CPU)
-            DETECTED_GPU=cpu
-            log "Switched to CPU build (user choice)"
-            ;;
-        *)
-            : # keep CUDA
-            ;;
-    esac
-fi
+configure_gpu_override
+log "Runtime backend selection is handled by the installed engine (one platform artifact)"
 
 # DISTRO_TAG is meaningful only for Linux. macOS skips check_distro.
 DISTRO_TAG=""
@@ -524,35 +461,8 @@ fi
 # (FFmpeg 4 / native Mac tarball) and "-ubuntu24" on Ubuntu 24.04 / Debian 13
 # (FFmpeg 6 tarball variant). Set by check_distro() above.
 #
-# perf-wave-10B: GPU_TAG is "-cuda" when DETECTED_GPU=cuda (libcuda
-# present or explicit override) and "" otherwise. The CUDA variant is
-# only published for linux-x86_64; detect_gpu() already short-circuits
-# to "cpu" elsewhere, so this concat is safe everywhere.
-GPU_TAG=""
-if [ "$DETECTED_GPU" = "cuda" ]; then
-    GPU_TAG="-cuda"
-
-    # Not every release ships a CUDA tarball — the linux-x86_64-cuda
-    # build OOM-kills the 16 GB GitHub-hosted runner during the LTO
-    # link step (see release-ce.yml note on CARGO_PROFILE_RELEASE_LTO).
-    # When the GPU choice was auto-detected, probe the release asset
-    # before committing to the CUDA tarball; on 404, fall back to CPU.
-    # An explicit SYNAPCORES_GPU=cuda override is honored — we let the
-    # download fail loudly so the operator notices instead of silently
-    # getting a CPU binary.
-    if [ "$GPU_AUTO_DETECTED" = "true" ]; then
-        CUDA_TARBALL="synapcores-ce-${PINNED_VERSION}-${PLATFORM}${DISTRO_TAG}-cuda.tar.gz"
-        CUDA_URL="${RELEASE_BASE}/download/${PINNED_VERSION}/${CUDA_TARBALL}"
-        if curl -sfI "$CUDA_URL" >/dev/null 2>&1; then
-            log "CUDA tarball confirmed for ${PINNED_VERSION}"
-        else
-            warn "CUDA tarball not published for ${PINNED_VERSION} — falling back to CPU build"
-            DETECTED_GPU=cpu
-            GPU_TAG=""
-        fi
-    fi
-fi
-TARBALL="synapcores-ce-${PINNED_VERSION}-${PLATFORM}${DISTRO_TAG}${GPU_TAG}.tar.gz"
+# The ordinary platform tarball includes its optional native backend modules.
+TARBALL="synapcores-ce-${PINNED_VERSION}-${PLATFORM}${DISTRO_TAG}.tar.gz"
 TARBALL_URL="${RELEASE_BASE}/download/${PINNED_VERSION}/${TARBALL}"
 CHECKSUM_URL="${TARBALL_URL}.sha256"
 
@@ -619,6 +529,23 @@ fi
 $SUDO_PREFIX install -m 0755 "$BINARY_SRC" "${INSTALL_PREFIX}/synapcores" \
     || fail "binary install failed"
 log "Installed: ${INSTALL_PREFIX}/synapcores"
+
+# Preserve optional backend modules before WORK_DIR disappears, including
+# binary-only/user installs. Never probe/load a GPU library during installation.
+BACKEND_PACKAGE_DIR="$(dirname "$BINARY_SRC")/lib/synapcores/backends"
+if [ -d "$BACKEND_PACKAGE_DIR" ]; then
+    BACKEND_INSTALL_DIR="${INSTALL_PREFIX}/lib/synapcores/backends"
+    $SUDO_PREFIX mkdir -p "$BACKEND_INSTALL_DIR" \
+        || fail "cannot create optional backend directory"
+    $SUDO_PREFIX cp -R "${BACKEND_PACKAGE_DIR}/." "$BACKEND_INSTALL_DIR/" \
+        || fail "optional backend install failed"
+    if [ -d "$(dirname "$BINARY_SRC")/licenses/cuda" ]; then
+        $SUDO_PREFIX mkdir -p "${INSTALL_PREFIX}/licenses/cuda"
+        $SUDO_PREFIX cp -R "$(dirname "$BINARY_SRC")/licenses/cuda/." "${INSTALL_PREFIX}/licenses/cuda/" \
+            || fail "CUDA redistribution notice install failed"
+    fi
+    log "Installed optional GPU backend files; runtime will verify and probe them safely."
+fi
 
 # ONNX Runtime is loaded relative to the installed executable. Preserve it
 # before WORK_DIR is deleted, including macOS, user and binary-only installs.
@@ -808,6 +735,12 @@ if [ "$DETECTED_OS" = "darwin" ]; then
 
     mkdir -p "$SC_HOME" "$SC_DATA_DIR" "$SC_MODELS_DIR"
     chmod 700 "$SC_HOME"
+    # The bridge travels with every release, including offline tarballs.
+    if [ -r "$(dirname "$BINARY_SRC")/synapcores-mcp-bridge.js" ]; then
+        install -m 0755 "$(dirname "$BINARY_SRC")/synapcores-mcp-bridge.js" "$SC_HOME/synapcores-mcp-bridge.js"
+    else
+        warn "Release lacks the MCP bridge; fetch /v1/mcp/bridge from the running gateway if needed."
+    fi
     START_HELPER="${INSTALL_PREFIX}/synapcores-start"
     [ -x "$START_HELPER" ] || fail "release is missing synapcores-start.sh; install a complete current release folder"
 
@@ -862,7 +795,7 @@ default_timeout_ms     = 300000
 
 [query.ai_service]
 provider        = "local"
-model           = "qwen2.5-coder:7b"
+# model omitted: choose local chat model from the effective inference budget
 embedding_model = "all-minilm:latest"
 auto_pull       = true
 
@@ -888,13 +821,18 @@ MIN_CFG
     # dir's content-addressed store. The gateway.toml above sets
     # auto_pull = true so first-use works regardless — pre-pulling
     # just front-loads the ~4.4 GB download into the install step.
-    DEFAULT_MODEL="qwen2.5-coder:7b"
+    if ! DEFAULT_MODEL="$(AIDB_DATA_DIR="$SC_DATA_DIR" "${INSTALL_PREFIX}/synapcores" --config "$SC_CONFIG" models default)"; then
+        DEFAULT_MODEL=""
+        warn "No local model selected; pre-pull skipped. Remote providers require no local model. Inspect any configuration error above."
+    fi
     INSTALLED_BIN="${INSTALL_PREFIX}/synapcores"
 
     # Existing models belong to the operator. Upgrades never delete legacy
     # GGUFs or imported bundles; migrations can retain their explicit paths.
 
-    if [ ! -x "$INSTALLED_BIN" ]; then
+    if [ -z "$DEFAULT_MODEL" ]; then
+        log "No local chat model selected; no model download attempted."
+    elif [ ! -x "$INSTALLED_BIN" ]; then
         warn "installed binary not found at ${INSTALLED_BIN}; skipping pre-pull."
         warn "warm-on-boot + auto_pull = true in gateway.toml will pull on first start."
     elif [ -n "${SYNAPCORES_NO_MODEL_DOWNLOAD:-}" ]; then
@@ -909,7 +847,7 @@ MIN_CFG
             warn "Pull manually later:  ${INSTALLED_BIN} pull ${DEFAULT_MODEL}"
             DL_ANSWER="n"
         else
-            printf '\033[1;34m[get-synapcores]\033[0m Pre-pull default LLM (qwen2.5-coder:7b, ~4.4GB) from registry.ollama.ai? [Y/n] '
+            printf '\033[1;34m[get-synapcores]\033[0m Pre-pull selected local model from registry.ollama.ai? [Y/n] '
             read -r DL_ANSWER < /dev/tty || DL_ANSWER="n"
         fi
 
@@ -1010,6 +948,9 @@ if curl -fsSL "$INSTALLER_URL" -o "$INSTALLER" 2>/dev/null; then
         "SYNAPCORES_NONINTERACTIVE=${SYNAPCORES_NONINTERACTIVE:-}" "$@"
     if [ -n "${AIDB_DATA_DIR:-}" ]; then
         set -- env "AIDB_DATA_DIR=$AIDB_DATA_DIR" "$@"
+    fi
+    if [ "${AIDB_GPU_LAYERS+x}" = x ]; then
+        set -- env "AIDB_GPU_LAYERS=$AIDB_GPU_LAYERS" "$@"
     fi
     if [ -n "$USER_INSTALL" ] || [ "$(id -u)" -eq 0 ]; then
         "$@"
