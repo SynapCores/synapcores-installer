@@ -933,7 +933,12 @@ INSTALLER="${WORK_DIR}/install-ce.sh"
 log "Fetching system installer..."
 if curl -fsSL "$INSTALLER_URL" -o "$INSTALLER" 2>/dev/null; then
     chmod +x "$INSTALLER"
-    set -- "$INSTALLER" --binary "${INSTALL_PREFIX}/synapcores"
+    # issue #33 fix: point install-ce.sh at the EXTRACTED tarball binary, which
+    # sits beside the bundled FFmpeg runtime (lib/libavutil.so.*). install-ce.sh
+    # detects lib/ next to --binary, stages it into the prefix, and bakes
+    # LD_LIBRARY_PATH into the unit. Passing the already-installed prefix copy
+    # (no adjacent lib/) left fresh hosts with no libavutil.so.56 at runtime.
+    set -- "$INSTALLER" --binary "$BINARY_SRC"
     if [ "$NLI_OPT_IN" = 1 ]; then
         set -- "$@" --with-nli --nli-model "$NLI_MODEL"
     fi
