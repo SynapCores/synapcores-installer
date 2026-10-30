@@ -467,14 +467,39 @@ TARBALL_URL="${RELEASE_BASE}/download/${PINNED_VERSION}/${TARBALL}"
 CHECKSUM_URL="${TARBALL_URL}.sha256"
 
 WORK_DIR=$(mktemp -d)
-trap 'rm -rf "$WORK_DIR"' EXIT INT TERM
+# Rollback state (armed only for a Linux system upgrade, below). On any
+# non-success exit we restore the pre-upgrade binary so a failed upgrade never
+# leaves a new binary on disk while the old process serves a deleted inode.
+ROLLBACK_BIN=""
+INSTALL_OK=0
+cleanup() {
+    if [ "${INSTALL_OK:-0}" -ne 1 ] && [ -n "${ROLLBACK_BIN:-}" ] && [ -f "${ROLLBACK_BIN}.prev" ]; then
+        if ${SUDO_PREFIX:-} install -m 0755 "${ROLLBACK_BIN}.prev" "$ROLLBACK_BIN" 2>/dev/null; then
+            printf '%s\n' "[get-synapcores] install did not complete; restored the pre-upgrade synapcores binary" >&2
+            # Ensure the restored (old) binary is what's actually running, in
+            # case a failed restart left the unit stopped.
+            if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+                ${SUDO_PREFIX:-} systemctl restart synapcores.service >/dev/null 2>&1 || true
+            fi
+        fi
+    fi
+    [ -n "${ROLLBACK_BIN:-}" ] && ${SUDO_PREFIX:-} rm -f "${ROLLBACK_BIN}.prev" 2>/dev/null || true
+    rm -rf "$WORK_DIR" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
 
 log "Downloading ${TARBALL}..."
-curl -fsSL "$TARBALL_URL" -o "${WORK_DIR}/${TARBALL}" \
-    || fail "download failed: $TARBALL_URL"
+# Resilient fetch: retry transient errors, bound the connect, and ABORT a
+# stalled transfer (<2 KB/s for 60s) so a flaky link fails loudly and retries
+# instead of hanging silently. -C - resumes a partial file across retries.
+curl -fSL --retry 3 --retry-delay 3 --retry-connrefused \
+    --connect-timeout 30 --speed-time 60 --speed-limit 2048 -C - \
+    "$TARBALL_URL" -o "${WORK_DIR}/${TARBALL}" \
+    || fail "download failed (or stalled): $TARBALL_URL"
 
 log "Downloading checksum..."
-curl -fsSL "$CHECKSUM_URL" -o "${WORK_DIR}/${TARBALL}.sha256" \
+curl -fsSL --retry 3 --retry-delay 2 --retry-connrefused --connect-timeout 30 \
+    "$CHECKSUM_URL" -o "${WORK_DIR}/${TARBALL}.sha256" \
     || fail "checksum download failed: $CHECKSUM_URL"
 
 # ---------------------------------------------------------------------
@@ -523,6 +548,14 @@ if [ -n "$USER_INSTALL" ] || [ "$(id -u)" -eq 0 ]; then
 else
     log "Installing to ${INSTALL_PREFIX} requires sudo..."
     SUDO_PREFIX="sudo"
+fi
+
+# Arm rollback for a Linux system upgrade: snapshot the existing binary before
+# we overwrite it, so the cleanup trap restores it if the install later fails.
+if [ "$DETECTED_OS" = "linux" ] && [ -z "$USER_INSTALL" ] && [ -f "${INSTALL_PREFIX}/synapcores" ]; then
+    if $SUDO_PREFIX cp -p "${INSTALL_PREFIX}/synapcores" "${INSTALL_PREFIX}/synapcores.prev" 2>/dev/null; then
+        ROLLBACK_BIN="${INSTALL_PREFIX}/synapcores"
+    fi
 fi
 
 # shellcheck disable=SC2086
@@ -931,7 +964,8 @@ INSTALLER_URL="${RELEASE_BASE}/download/${PINNED_VERSION}/install-ce.sh"
 INSTALLER="${WORK_DIR}/install-ce.sh"
 
 log "Fetching system installer..."
-if curl -fsSL "$INSTALLER_URL" -o "$INSTALLER" 2>/dev/null; then
+if curl -fsSL --retry 3 --retry-delay 2 --retry-connrefused --connect-timeout 30 \
+        "$INSTALLER_URL" -o "$INSTALLER" 2>/dev/null; then
     chmod +x "$INSTALLER"
     # issue #33 fix: point install-ce.sh at the EXTRACTED tarball binary, which
     # sits beside the bundled FFmpeg runtime (lib/libavutil.so.*). install-ce.sh
@@ -968,4 +1002,7 @@ else
     warn "binary is installed; complete setup manually per the docs"
 fi
 
+# Reached the end of the Linux path successfully — disarm rollback so the
+# cleanup trap keeps the new binary and just removes the backup + work dir.
+INSTALL_OK=1
 log "Done. Try: synapcores --version"
