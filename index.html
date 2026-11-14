@@ -558,6 +558,17 @@ if [ "$DETECTED_OS" = "linux" ] && [ -z "$USER_INSTALL" ] && [ -f "${INSTALL_PRE
     fi
 fi
 
+# Ensure the destination directory exists before install. User mode mkdir'd it
+# above, but in system mode $INSTALL_PREFIX (default /usr/local/bin) is NOT
+# guaranteed to exist — notably on a clean Apple Silicon Mac, where
+# /usr/local/bin is frequently absent (Homebrew lives in /opt/homebrew). BSD
+# `install` writes through its own temp file in the target dir, so a missing
+# directory fails as `install: .../INS@xxxxx: No such file or directory` rather
+# than anything obvious. Create it (with sudo in system mode) first.
+# shellcheck disable=SC2086
+$SUDO_PREFIX mkdir -p "$INSTALL_PREFIX" \
+    || fail "could not create ${INSTALL_PREFIX}"
+
 # shellcheck disable=SC2086
 $SUDO_PREFIX install -m 0755 "$BINARY_SRC" "${INSTALL_PREFIX}/synapcores" \
     || fail "binary install failed"
