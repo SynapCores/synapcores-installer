@@ -14,6 +14,9 @@
 # Or, to pin a specific release:
 #   curl -fsSL https://get.synapcores.com/install.sh | SYNAPCORES_VERSION=v1.2.0 sh
 #
+# Site install buttons tag the copied command with where it came from:
+#   curl -fsSL https://get.synapcores.com | SYNAPCORES_REF=home-hero sh
+#
 # Environment variables:
 #   SYNAPCORES_USER_INSTALL=1   Install for the current user only:
 #                               binary → ~/.local/bin, config + data →
@@ -26,6 +29,8 @@
 #   SYNAPCORES_BINARY_ONLY=1    Drop the binary and stop. Operator
 #                               handles config and service themselves.
 #   SYNAPCORES_VERSION=<tag>    Pin a specific release tag.
+#   SYNAPCORES_REF=<tag>        Attribution tag for the install counter
+#                               (letters, digits, - and _; max 40).
 #   SYNAPCORES_NONINTERACTIVE=1 Skip prompts; assume safe defaults.
 #   SYNAPCORES_WITH_NLI=1      Install and enable semantic verification.
 #   SYNAPCORES_NLI_MODEL=...   Curated alias (default nli-default; nli-xsmall optional).
@@ -446,10 +451,14 @@ log "Version: $PINNED_VERSION"
 # One fire-and-forget GET after platform + version are resolved and
 # before the download starts. curl-pipe-sh leaves no trace on GitHub
 # Pages, so this is the only way we can count CLI installs. Sends only
-# the version tag, OS and arch (already public in the tarball URL).
+# the version tag, OS and arch (already public in the tarball URL), plus
+# the site surface the command was copied from (SYNAPCORES_REF, set by the
+# copy buttons on synapcores.com; GitHub Pages drops ?ref= query strings).
 # 5-second timeout; `|| true` means a down counter never blocks install.
 if [ -z "${COUNTER_OPT_OUT:-}" ]; then
-    _counter_url="https://synapcores.com/api/install-counter?v=${PINNED_VERSION}&os=${DETECTED_OS}&arch=${DETECTED_ARCH}&channel=cli"
+    _counter_ref=$(printf '%s' "${SYNAPCORES_REF:-}" | LC_ALL=C tr -cd 'A-Za-z0-9_-' | cut -c1-40)
+    [ -n "$_counter_ref" ] || _counter_ref=none
+    _counter_url="https://synapcores.com/api/install-counter?v=${PINNED_VERSION}&os=${DETECTED_OS}&arch=${DETECTED_ARCH}&channel=cli&ref=${_counter_ref}"
     curl -fsSL --max-time 5 -o /dev/null "$_counter_url" 2>/dev/null || true
 fi
 
