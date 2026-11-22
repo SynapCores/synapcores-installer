@@ -75,14 +75,16 @@
           <a href="https://brew.sh">brew.sh</a>, then run the "Next steps"
           commands it prints:
         <pre><code>/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"</code></pre></li>
-      <li>Install SynapCores. Enter your Mac password when asked; the defaults
-          include the Homebrew install of ffmpeg, tesseract and leptonica:
+      <li>Install SynapCores. Enter your Mac password when asked, then press
+          Enter at each prompt: the defaults install ffmpeg, tesseract and
+          leptonica with Homebrew, then start SynapCores and print your admin
+          password:
         <pre><code>curl -fsSL https://get.synapcores.com/install.sh | sh</code></pre></li>
-      <li>Start SynapCores, now and at every login (use this instead of the
-          start command the installer prints):
+      <li>Answered n to &ldquo;Start SynapCores now?&rdquo; Start it, now and
+          at every login:
         <pre><code>launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.synapcores.gateway.plist</code></pre></li>
-      <li>Show your admin password and API key (give the first start a few
-          seconds):
+      <li>Show your admin password and API key again (after a manual start,
+          give it a few seconds):
         <pre><code>grep -A9 "FIRST-BOOT CREDENTIALS" ~/.synapcores/logs/gateway.err.log</code></pre></li>
       <li>Open <code>http://localhost:8080</code>, sign in as <code>admin</code>
           and change the password.</li>
