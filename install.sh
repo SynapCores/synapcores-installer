@@ -19,7 +19,8 @@
 #
 # Environment variables:
 #   SYNAPCORES_USER_INSTALL=1   Install for the current user only:
-#                               binary → ~/.local/bin, config + data →
+#                               launcher → ~/.local/bin, release folder
+#                               → ~/.synapcores/runtime, config + data →
 #                               ~/.synapcores, no system user, no
 #                               systemd unit. Good for kicking the
 #                               tires without touching system state.
@@ -49,7 +50,8 @@
 #   3. Downloads the matching binary tarball + checksum
 #   4. Verifies the checksum
 #   5. Drops the binary at /usr/local/bin/synapcores (system mode,
-#      requires sudo) or ~/.local/bin/synapcores (user mode, no sudo).
+#      requires sudo) or a launcher at ~/.local/bin/synapcores for the
+#      release kept in ~/.synapcores/runtime (user mode, no sudo).
 #   6. Hands off to install-ce.sh for setup (system: useradd, /opt
 #      layout, /etc/systemd unit; user: ~/.synapcores layout, no
 #      systemd unit). Skipped entirely if SYNAPCORES_BINARY_ONLY is set.
@@ -543,6 +545,38 @@ if [ -z "$BINARY_SRC" ] || [ ! -x "$BINARY_SRC" ]; then
 fi
 
 # ---------------------------------------------------------------------
+# Keep the release folder (Linux user mode)
+# ---------------------------------------------------------------------
+#
+# install-ce.sh --user runs the binary, its bundled lib/ (FFmpeg) and the ONNX
+# runtime in place from the folder that holds --binary, and records those paths
+# in its start command and in the private env file. WORK_DIR is removed when
+# this script exits, so user mode first moves the verified release folder to
+# ~/.synapcores/runtime and installs from there. The path stays the same across
+# upgrades (a newer release replaces the folder), so the recorded paths stay
+# valid. ${INSTALL_PREFIX}/synapcores becomes a small launcher for it.
+SC_RUNTIME_DIR=""
+if [ "$DETECTED_OS" = "linux" ] && [ -n "$USER_INSTALL" ] && [ -z "$BINARY_ONLY" ]; then
+    SC_RUNTIME_DIR="${HOME}/.synapcores/runtime"
+    SC_RUNTIME_NEW="${SC_RUNTIME_DIR}.new"
+    SC_BUNDLE_DIR=$(dirname "$BINARY_SRC")
+    log "Keeping the release runtime at ${SC_RUNTIME_DIR}..."
+    rm -rf "$SC_RUNTIME_NEW"
+    mkdir -p "$SC_RUNTIME_NEW" || fail "could not create ${SC_RUNTIME_NEW}"
+    for SC_ENTRY in "$SC_BUNDLE_DIR"/* "$SC_BUNDLE_DIR"/.[!.]*; do
+        [ -e "$SC_ENTRY" ] || continue
+        # A flat archive would sit beside the download itself; leave that behind.
+        case "$SC_ENTRY" in "${WORK_DIR}/${TARBALL}"|"${WORK_DIR}/${TARBALL}.sha256") continue ;; esac
+        mv "$SC_ENTRY" "$SC_RUNTIME_NEW/" \
+            || fail "could not move the release into ${SC_RUNTIME_NEW} (check free disk space)"
+    done
+    rm -rf "$SC_RUNTIME_DIR"
+    mv "$SC_RUNTIME_NEW" "$SC_RUNTIME_DIR" || fail "could not finalize ${SC_RUNTIME_DIR}"
+    BINARY_SRC="${SC_RUNTIME_DIR}/synapcores"
+    [ -x "$BINARY_SRC" ] || fail "release runtime is missing ${BINARY_SRC}"
+fi
+
+# ---------------------------------------------------------------------
 # Install binary
 # ---------------------------------------------------------------------
 
@@ -578,15 +612,36 @@ fi
 $SUDO_PREFIX mkdir -p "$INSTALL_PREFIX" \
     || fail "could not create ${INSTALL_PREFIX}"
 
-# shellcheck disable=SC2086
-$SUDO_PREFIX install -m 0755 "$BINARY_SRC" "${INSTALL_PREFIX}/synapcores" \
-    || fail "binary install failed"
-log "Installed: ${INSTALL_PREFIX}/synapcores"
+if [ -n "$SC_RUNTIME_DIR" ]; then
+    # Linux user mode: a launcher that runs the kept release with its bundled
+    # libraries, so `synapcores --version` and the CLI work from any shell.
+    sh_quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+    SC_LAUNCHER_TMP="${INSTALL_PREFIX}/.synapcores.launcher.$$"
+    # shellcheck disable=SC2016
+    {
+        printf '%s\n' '#!/bin/sh' \
+            '# SynapCores Community Edition launcher (user install from get.synapcores.com).' \
+            '# Runs the release kept in SC_RUNTIME with its bundled libraries.'
+        printf 'SC_RUNTIME=%s\n' "$(sh_quote "$SC_RUNTIME_DIR")"
+        printf '%s\n' 'LD_LIBRARY_PATH="$SC_RUNTIME/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"' \
+            'export LD_LIBRARY_PATH' \
+            'exec "$SC_RUNTIME/synapcores" "$@"'
+    } > "$SC_LAUNCHER_TMP" && chmod 0755 "$SC_LAUNCHER_TMP" \
+        && mv -f "$SC_LAUNCHER_TMP" "${INSTALL_PREFIX}/synapcores" \
+        || fail "launcher install failed"
+    log "Installed: ${INSTALL_PREFIX}/synapcores (launcher for ${SC_RUNTIME_DIR}/synapcores)"
+else
+    # shellcheck disable=SC2086
+    $SUDO_PREFIX install -m 0755 "$BINARY_SRC" "${INSTALL_PREFIX}/synapcores" \
+        || fail "binary install failed"
+    log "Installed: ${INSTALL_PREFIX}/synapcores"
+fi
 
 # Preserve optional backend modules before WORK_DIR disappears, including
 # binary-only/user installs. Never probe/load a GPU library during installation.
+# (Linux user mode already keeps them in ${SC_RUNTIME_DIR}.)
 BACKEND_PACKAGE_DIR="$(dirname "$BINARY_SRC")/lib/synapcores/backends"
-if [ -d "$BACKEND_PACKAGE_DIR" ]; then
+if [ -z "$SC_RUNTIME_DIR" ] && [ -d "$BACKEND_PACKAGE_DIR" ]; then
     BACKEND_INSTALL_DIR="${INSTALL_PREFIX}/lib/synapcores/backends"
     $SUDO_PREFIX mkdir -p "$BACKEND_INSTALL_DIR" \
         || fail "cannot create optional backend directory"
@@ -604,8 +659,9 @@ fi
 # before WORK_DIR is deleted, including macOS, user and binary-only installs.
 # Existing tarballs without an ONNX manifest keep their previous capability;
 # a new manifest with missing runtime/attribution is a broken package.
+# (Linux user mode already keeps it in ${SC_RUNTIME_DIR}.)
 ONNX_PACKAGE_DIR="$(dirname "$BINARY_SRC")"
-if [ -f "${ONNX_PACKAGE_DIR}/onnx-runtime-manifest.json" ]; then
+if [ -z "$SC_RUNTIME_DIR" ] && [ -f "${ONNX_PACKAGE_DIR}/onnx-runtime-manifest.json" ]; then
     case "$DETECTED_OS" in
         linux) ONNX_LIBRARY_NAME="libonnxruntime.so" ;;
         darwin) ONNX_LIBRARY_NAME="libonnxruntime.dylib" ;;
@@ -980,6 +1036,31 @@ fi
 #     systemd unit (foreground binary).
 # install-ce.sh is allowed to use bash — it's saved to disk first, so
 # its shebang is honored. Only THIS bootstrap has to be POSIX-clean.
+
+# User mode: an earlier user install may have recorded an ONNX runtime path in
+# its deleted temporary folder. The startup helper keeps an existing
+# ORT_DYLIB_PATH, so drop one that no longer resolves; install-ce.sh then
+# records the runtime kept in ${SC_RUNTIME_DIR}.
+if [ -n "$SC_RUNTIME_DIR" ]; then
+    SC_DATA_DIR="${AIDB_DATA_DIR:-${HOME}/.synapcores/aidb_data}"
+    if [ -f "${HOME}/.synapcores/gateway.toml" ]; then
+        SC_DATA_DIR=$("${INSTALL_PREFIX}/synapcores" --config "${HOME}/.synapcores/gateway.toml" models data-dir 2>/dev/null) \
+            || SC_DATA_DIR=""
+    fi
+    SC_ENV_FILE="${SC_DATA_DIR}/synapcores.env"
+    if [ -n "$SC_DATA_DIR" ] && [ -f "$SC_ENV_FILE" ] && [ ! -L "$SC_ENV_FILE" ]; then
+        SC_ORT=$(sed -n 's/^[[:space:]]*\(export[[:space:]][[:space:]]*\)\{0,1\}ORT_DYLIB_PATH=//p' "$SC_ENV_FILE" | tail -n 1)
+        SC_ORT=${SC_ORT#\'}; SC_ORT=${SC_ORT%\'}; SC_ORT=${SC_ORT#\"}; SC_ORT=${SC_ORT%\"}
+        if [ -n "$SC_ORT" ] && [ ! -r "$SC_ORT" ]; then
+            ( umask 077 && sed '/^[[:space:]]*\(export[[:space:]][[:space:]]*\)\{0,1\}ORT_DYLIB_PATH=/d' \
+                "$SC_ENV_FILE" > "${SC_ENV_FILE}.tmp" ) \
+                && mv -f "${SC_ENV_FILE}.tmp" "$SC_ENV_FILE" \
+                || fail "could not update ${SC_ENV_FILE}"
+            log "Updated the ONNX runtime path left by an earlier user install."
+        fi
+    fi
+fi
+
 INSTALLER_URL="${RELEASE_BASE}/download/${PINNED_VERSION}/install-ce.sh"
 INSTALLER="${WORK_DIR}/install-ce.sh"
 
@@ -1025,4 +1106,15 @@ fi
 # Reached the end of the Linux path successfully — disarm rollback so the
 # cleanup trap keeps the new binary and just removes the backup + work dir.
 INSTALL_OK=1
-log "Done. Try: synapcores --version"
+if [ -n "$SC_RUNTIME_DIR" ]; then
+    case ":${PATH}:" in
+        *":${INSTALL_PREFIX}:"*) SC_TRY="synapcores --version" ;;
+        *) SC_TRY="\"${INSTALL_PREFIX}/synapcores\" --version" ;;
+    esac
+    log "Done. Release folder (with install-ce.sh): ${SC_RUNTIME_DIR}"
+    log "Try: ${SC_TRY}"
+elif [ -x /opt/synapcores/synapcores ]; then
+    log "Done. Try: LD_LIBRARY_PATH=/opt/synapcores/lib /opt/synapcores/synapcores --version"
+else
+    log "Done. Try: synapcores --version"
+fi
