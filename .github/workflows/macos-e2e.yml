@@ -1,0 +1,143 @@
+name: macOS end-to-end install
+
+# Installs SynapCores on a fresh GitHub-hosted Mac (Apple Silicon) the way a new user does,
+# for the installer on this branch ("draft") and for the live get.synapcores.com ("live"):
+#   1. no Homebrew: the installer must stop at the Homebrew check (the draft must not
+#      download or install anything first);
+#   2. with Homebrew: full install, start, /health, then sign in with the first-boot
+#      password using the exact command printed on synapcores.com/download.
+# Telemetry and the install counter are off for every run, and the runner's GitHub
+# address is classified as CI anyway, so a run never counts as a real install.
+# Logs are uploaded with passwords and keys redacted.
+
+on:
+  pull_request:
+    paths:
+      - install.sh
+      - index.html
+      - .github/workflows/macos-e2e.yml
+  workflow_dispatch:
+
+concurrency:
+  group: macos-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  e2e:
+    name: ${{ matrix.installer }} installer, macOS 15 (Apple Silicon)
+    runs-on: macos-15
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        installer: [draft, live]
+    env:
+      COUNTER_OPT_OUT: "1"
+      DO_NOT_TRACK: "1"
+      SYNAPCORES_TELEMETRY: "off"
+      SYNAPCORES_NO_MODEL_DOWNLOAD: "1"
+      SYNAPCORES_NONINTERACTIVE: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Runner facts
+        run: |
+          sw_vers
+          uname -m
+          echo "brew: $(command -v brew) $(brew --version | head -1)"
+          echo "user: $(id -un) uid $(id -u)"
+          ls -ld /usr/local/bin/synapcores ~/.synapcores 2>&1 || true
+
+      - name: Pick the installer
+        run: |
+          if [ "${{ matrix.installer }}" = draft ]; then
+            cp install.sh "$RUNNER_TEMP/installer.sh"
+          else
+            curl -fsSL https://get.synapcores.com -o "$RUNNER_TEMP/installer.sh"
+          fi
+          shasum -a 256 "$RUNNER_TEMP/installer.sh"
+
+      - name: Keep the engine's telemetry off from its first start
+        run: |
+          mkdir -p ~/.synapcores && chmod 700 ~/.synapcores
+          (umask 077; printf 'export DO_NOT_TRACK=1\nexport SYNAPCORES_TELEMETRY=off\n' > ~/.synapcores/synapcores.env)
+
+      - name: "Step 1: a Mac without Homebrew"
+        run: |
+          sudo mv /opt/homebrew /opt/homebrew.hidden
+          set +e
+          env PATH=/usr/bin:/bin:/usr/sbin:/sbin sh "$RUNNER_TEMP/installer.sh" < /dev/null > "$RUNNER_TEMP/nobrew.log" 2>&1
+          rc=$?
+          set -e
+          sudo mv /opt/homebrew.hidden /opt/homebrew
+          cat "$RUNNER_TEMP/nobrew.log"
+          echo "exit code: $rc"
+          if [ -e /usr/local/bin/synapcores ]; then installed=yes; else installed=no; fi
+          echo "installed anything before the Homebrew check: $installed"
+          grep -q "Homebrew is required" "$RUNNER_TEMP/nobrew.log" || { echo "::error::no 'Homebrew is required' message"; exit 1; }
+          [ "$rc" -ne 0 ] || { echo "::error::installer did not stop without Homebrew"; exit 1; }
+          if [ "${{ matrix.installer }}" = draft ] && [ "$installed" = yes ]; then
+            echo "::error::draft installer wrote files before the Homebrew check"; exit 1
+          fi
+
+      - name: "Step 2: install SynapCores (Homebrew present)"
+        run: |
+          export SYNAPCORES_START=1   # draft: start via launchd at the end; ignored by the live installer
+          sh "$RUNNER_TEMP/installer.sh" < /dev/null 2>&1 | tee "$RUNNER_TEMP/install.log"
+
+      - name: "Step 3: start SynapCores (live installer: the documented launchctl command)"
+        if: matrix.installer == 'live'
+        run: launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.synapcores.gateway.plist
+
+      - name: Wait for /health
+        run: |
+          for i in $(seq 1 90); do
+            if curl -fsS http://127.0.0.1:8080/health > /dev/null 2>&1; then
+              echo "healthy after about $((i * 2)) s"; curl -s http://127.0.0.1:8080/health; echo; exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::no /health after 180 s"
+          launchctl print "gui/$(id -u)/com.synapcores.gateway" 2>&1 | head -40 || true
+          exit 1
+
+      - name: "Step 4-5: show the password (documented command) and sign in"
+        run: |
+          out=$(grep -A9 "FIRST-BOOT CREDENTIALS" ~/.synapcores/logs/gateway.err.log || true)
+          pw=$(printf '%s\n' "$out" | sed -n 's/.*password: //p' | head -1 | tr -d '[:space:]')
+          if [ -z "$pw" ]; then echo "::error::no password in ~/.synapcores/logs/gateway.err.log"; exit 1; fi
+          echo "::add-mask::$pw"
+          printf '%s\n' "$out" | sed -E 's/(password: ).*/\1***/; s/(API key: ).*/\1***/'
+          body=$(python3 -c 'import json, sys; print(json.dumps({"username": "admin", "password": sys.argv[1]}))' "$pw")
+          code=$(curl -s -o "$RUNNER_TEMP/login.json" -w '%{http_code}' -X POST http://127.0.0.1:8080/v1/auth/login \
+                   -H 'content-type: application/json' -d "$body")
+          echo "login HTTP $code"
+          python3 - "$RUNNER_TEMP/login.json" <<'EOF'
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          tok = d.get("access_token") or (d.get("data") or {}).get("access_token")
+          assert tok, f"no access_token in login response (keys: {list(d)})"
+          print("signed in: access_token present")
+          EOF
+
+      - name: Logs, with passwords and keys redacted
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          for f in ~/.synapcores/logs/gateway.err.log ~/.synapcores/logs/gateway.out.log "$RUNNER_TEMP/install.log" "$RUNNER_TEMP/nobrew.log"; do
+            [ -f "$f" ] || continue
+            sed -E 's/(password: ).*/\1***/; s/(API key: ).*/\1***/; s/aidb_[A-Za-z0-9_-]+/aidb_***/g; s/eyJ[A-Za-z0-9_.-]+/eyJ***/g' \
+              "$f" > "$RUNNER_TEMP/out/$(basename "$f")"
+          done
+          ls -la "$RUNNER_TEMP/out"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: macos-${{ matrix.installer }}-logs
+          path: ${{ runner.temp }}/out
+          retention-days: 7
