@@ -33,6 +33,11 @@
 #   SYNAPCORES_REF=<tag>        Attribution tag for the install counter
 #                               (letters, digits, - and _; max 40).
 #   SYNAPCORES_NONINTERACTIVE=1 Skip prompts; assume safe defaults.
+#   SYNAPCORES_START=1|0        macOS: start (or restart) the launchd agent
+#                               at the end without asking (1), or never
+#                               start it (0). Unset: ask on a terminal;
+#                               non-interactive runs never start it.
+#   SYNAPCORES_START_TIMEOUT=<s> macOS: seconds to wait for /health (120).
 #   SYNAPCORES_WITH_NLI=1      Install and enable semantic verification.
 #   SYNAPCORES_NLI_MODEL=...   Curated alias (default nli-default; nli-xsmall optional).
 #   SYNAPCORES_NO_MODEL_DOWNLOAD=1  Use previously imported models, without pulling.
@@ -80,6 +85,8 @@ USER_INSTALL="${SYNAPCORES_USER_INSTALL:-}"
 INSTALL_PREFIX="${SYNAPCORES_PREFIX:-}"
 NLI_OPT_IN="${SYNAPCORES_WITH_NLI:-0}"
 NLI_MODEL="${SYNAPCORES_NLI_MODEL:-nli-default}"
+START_NOW="${SYNAPCORES_START:-}"
+START_TIMEOUT="${SYNAPCORES_START_TIMEOUT:-120}"
 
 # ---------------------------------------------------------------------
 # Helpers
@@ -97,6 +104,15 @@ esac
 case "$NLI_MODEL" in
     nli-default|nli-small|nli-xsmall) ;;
     *) fail "Unknown NLI model; use nli-default or nli-xsmall" ;;
+esac
+case "$START_NOW" in
+    1|true|yes) START_NOW=1 ;;
+    0|false|no) START_NOW=0 ;;
+    "") ;;
+    *) fail "SYNAPCORES_START must be 0 or 1" ;;
+esac
+case "$START_TIMEOUT" in
+    ""|*[!0-9]*) fail "SYNAPCORES_START_TIMEOUT must be a whole number of seconds" ;;
 esac
 
 require() {
@@ -747,6 +763,92 @@ if [ -n "$BINARY_ONLY" ]; then
     exit 0
 fi
 
+# Command to re-run this install: keeps the attribution tag and the choices
+# that change what gets installed (sanitized the same way as the counter).
+mac_rerun_command() {
+    _rr_env=""
+    _rr_ref=$(printf '%s' "${SYNAPCORES_REF:-}" | LC_ALL=C tr -cd 'A-Za-z0-9_-' | cut -c1-40)
+    [ -z "$_rr_ref" ] || _rr_env="${_rr_env}SYNAPCORES_REF=${_rr_ref} "
+    _rr_ver=$(printf '%s' "${SYNAPCORES_VERSION:-}" | LC_ALL=C tr -cd 'A-Za-z0-9._-' | cut -c1-40)
+    [ -z "$_rr_ver" ] || _rr_env="${_rr_env}SYNAPCORES_VERSION=${_rr_ver} "
+    [ -z "$USER_INSTALL" ] || _rr_env="${_rr_env}SYNAPCORES_USER_INSTALL=1 "
+    [ -z "${COUNTER_OPT_OUT:-}" ] || _rr_env="${_rr_env}COUNTER_OPT_OUT=1 "
+    printf 'curl -fsSL https://get.synapcores.com | %ssh\n' "$_rr_env"
+}
+
+# Load the prepared launchd agent and wait for /health. Returns 0 when the
+# gateway answers under launchd, 1 when it was not started or exited (reason
+# printed), 2 when it is loaded but gave no answer within START_TIMEOUT.
+# Only this installer's own label is unloaded; a port owner is never stopped.
+mac_start_agent() {
+    if launchctl print "$SC_TARGET" >/dev/null 2>&1; then
+        log "Unloading the loaded ${SC_LABEL} agent so the new binary and plist take effect..."
+        launchctl bootout "$SC_TARGET" 2>/dev/null || true
+        _ms_waited=0
+        while launchctl print "$SC_TARGET" >/dev/null 2>&1; do
+            if [ "$_ms_waited" -ge 40 ]; then
+                warn "launchd still lists ${SC_TARGET} after 40s; not starting another copy."
+                return 1
+            fi
+            sleep 1
+            _ms_waited=$((_ms_waited + 1))
+        done
+    fi
+    # The helper's own launch-time port check, plus a plain connect that also
+    # sees listeners lsof cannot (other users, root, VM port forwarding).
+    if ! "$START_HELPER" --check-ports --config "$SC_CONFIG"; then
+        warn "Not starting: port ${SC_PORT} is taken (or the [server] address is unsupported)."
+        warn "Who is listening:  lsof -nP -iTCP:${SC_PORT} -sTCP:LISTEN"
+        warn "If that is a SynapCores you started by hand, stop it first (Ctrl-C in its terminal)."
+        return 1
+    fi
+    if curl -gs --noproxy '*' -o /dev/null --max-time 3 "http://${SC_HOST}:${SC_PORT}/" 2>/dev/null; then
+        _ms_rc=0
+    else
+        _ms_rc=$?
+    fi
+    if [ "$_ms_rc" -ne 7 ]; then
+        warn "Not starting: something already accepts connections on ${SC_HOST}:${SC_PORT}."
+        return 1
+    fi
+    if [ -f "$SC_ERR_LOG" ]; then
+        SC_ERR_OFFSET=$(wc -c <"$SC_ERR_LOG" | tr -d ' ')
+        case "$SC_ERR_OFFSET" in ""|*[!0-9]*) SC_ERR_OFFSET=0 ;; esac
+    fi
+    if ! launchctl bootstrap "$SC_DOMAIN" "$SC_PLIST"; then
+        if launchctl print-disabled "$SC_DOMAIN" 2>/dev/null \
+            | grep -Eq "\"${SC_LABEL}\" => (disabled|true)"; then
+            warn "${SC_LABEL} is disabled for this user (System Settings > General > Login Items)."
+            warn "Allow it, then start again:  launchctl enable ${SC_TARGET}"
+        fi
+        return 1
+    fi
+    SC_BOOTSTRAPPED=1
+    log "Started ${SC_LABEL}; waiting up to ${START_TIMEOUT}s for ${SC_HEALTH_URL} ..."
+    _ms_waited=0
+    while [ "$_ms_waited" -lt "$START_TIMEOUT" ]; do
+        if ! _ms_state=$(launchctl print "$SC_TARGET" 2>/dev/null); then
+            warn "launchd no longer lists ${SC_TARGET}."
+            return 1
+        fi
+        # `launchctl print` is not a stable format: it only speeds up failure
+        # detection; success is decided by /health alone.
+        case "$_ms_state" in
+            *"state = running"*) ;;
+            *"last exit code = "[0-9]*)
+                warn "The gateway exited during startup:  launchctl print ${SC_TARGET}"
+                return 1
+                ;;
+        esac
+        if curl -gfs --noproxy '*' -o /dev/null --max-time 2 "$SC_HEALTH_URL" 2>/dev/null; then
+            return 0
+        fi
+        sleep 2
+        _ms_waited=$((_ms_waited + 2))
+    done
+    return 2
+}
+
 # macOS path: detect missing Homebrew deps and offer to install them.
 # install-ce.sh is a Linux installer (useradd, apt-get, systemd) and
 # would fail with "useradd: command not found" on macOS — we don't
@@ -758,13 +860,50 @@ fi
 #
 # Set SYNAPCORES_NONINTERACTIVE=1 to skip the prompt and install
 # missing deps automatically (CI / automation).
+
 if [ "$DETECTED_OS" = "darwin" ]; then
+    # Right after a fresh Homebrew install, brew is not on PATH until the user
+    # runs Homebrew's "Next steps" shellenv line, so also look in the standard
+    # prefixes (PATH wins, so custom installs and test fixtures still apply).
     if ! command -v brew >/dev/null 2>&1; then
-        warn "Homebrew is required for macOS runtime deps (ffmpeg/tesseract/leptonica)."
-        warn "Install Homebrew first:  https://brew.sh"
-        warn "Then re-run:  curl -fsSL https://get.synapcores.com/install.sh | sh"
+        for SC_BREW in /opt/homebrew/bin/brew /usr/local/bin/brew; do
+            if [ -x "$SC_BREW" ]; then
+                PATH="${SC_BREW%/brew}:${PATH}"
+                export PATH
+                log "Using Homebrew at ${SC_BREW} (it is not on this shell's PATH yet)."
+                break
+            fi
+        done
+    fi
+    if ! command -v brew >/dev/null 2>&1; then
+        SC_RERUN=$(mac_rerun_command)
+        cat >&2 <<BREW_MISSING_EOF
+
+[get-synapcores] Homebrew is required for the macOS runtime deps (ffmpeg, tesseract, leptonica).
+
+  1. Install Homebrew with the official command from https://brew.sh:
+
+       /bin/bash -c "\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+  2. Run the "Next steps" lines Homebrew prints at the end, so brew is on your PATH.
+     For the current Terminal window on Apple Silicon:
+
+       eval "\$(/opt/homebrew/bin/brew shellenv)"
+
+  3. Re-run this installer (it also finds /opt/homebrew/bin/brew without step 2):
+
+       ${SC_RERUN}
+
+BREW_MISSING_EOF
         exit 1
     fi
+    case "$(command -v brew)" in
+        /usr/local/*)
+            warn "Using the Intel (Rosetta) Homebrew at $(command -v brew). This Apple Silicon build"
+            warn "loads ffmpeg/tesseract/leptonica from /opt/homebrew; if the edition check below"
+            warn "fails, install the native Homebrew with the official command at https://brew.sh."
+            ;;
+    esac
 
     # Pick the right ffmpeg formula. We try ffmpeg@7 first because
     # that's what the GitHub Actions release built against; if it's
@@ -1006,26 +1145,158 @@ MIN_CFG
     "$START_HELPER" --write-launchd --binary "$INSTALLED_BIN" --config "$SC_CONFIG" \
         --env-file "$SC_ENV_FILE" --plist "$SC_PLIST" \
         || fail "could not prepare launchd agent"
-    log "Prepared private environment and launchd agent; no service was loaded or started."
+    log "Prepared private environment and launchd agent."
 
-    cat <<MAC_FINISH_EOF
+    # ----- Offer to start the gateway now -----
+    #
+    # The plist is a per-user LaunchAgent with RunAtLoad, so launchd also
+    # starts it at the user's next login. Starting now = bootstrapping it into
+    # the GUI domain. Non-interactive runs never start it unless
+    # SYNAPCORES_START=1 asks for it; no usable terminal means no start.
+    SC_LABEL="com.synapcores.gateway"   # the label synapcores-start --write-launchd writes
+    SC_DOMAIN="gui/$(id -u)"
+    SC_TARGET="${SC_DOMAIN}/${SC_LABEL}"
+    SC_ERR_LOG="${SC_HOME}/logs/gateway.err.log"
+    SC_ERR_OFFSET=0
+    SC_BOOTSTRAPPED=0
+    SC_RUNNING=0
+    # Probe address from [server] listen_addr (the helper validates the same
+    # key before every launch); a wildcard bind is probed on loopback.
+    SC_LISTEN=$(awk '
+        /^[ \t]*\[/ { server = ($0 ~ /^[ \t]*\[[ \t]*server[ \t]*\]/); next }
+        server && /^[ \t]*listen_addr[ \t]*=/ {
+            v = $0; sub(/^[^=]*=[ \t]*/, "", v); q = substr(v, 1, 1)
+            if (q == "\"" || q == "\047") { v = substr(v, 2); n = index(v, q); if (n > 1) print substr(v, 1, n - 1) }
+            exit
+        }' "$SC_CONFIG" 2>/dev/null) || SC_LISTEN=""
+    SC_HOST=${SC_LISTEN%:*}
+    SC_PORT=${SC_LISTEN##*:}
+    case "$SC_PORT" in ""|*[!0-9]*) SC_HOST=127.0.0.1; SC_PORT=8080 ;; esac
+    case "$SC_HOST" in
+        ""|0.0.0.0|127.0.0.1|localhost) SC_HOST=127.0.0.1; SC_UI="http://localhost:${SC_PORT}/" ;;
+        "[::]"|"[::1]") SC_HOST="[::1]"; SC_UI="http://localhost:${SC_PORT}/" ;;
+        *) SC_UI="http://${SC_HOST}:${SC_PORT}/" ;;
+    esac
+    SC_HEALTH_URL="http://${SC_HOST}:${SC_PORT}/health"
 
-[get-synapcores] Done — start the gateway
+    SC_START_MODE=no
+    if [ "$START_NOW" = 1 ]; then
+        SC_START_MODE=auto
+    elif [ "$START_NOW" != 0 ] && [ -z "${SYNAPCORES_NONINTERACTIVE:-}" ] \
+        && ( : </dev/tty ) 2>/dev/null; then
+        SC_START_MODE=ask
+    fi
+    if [ "$SC_START_MODE" != no ] && [ "$(id -u)" -eq 0 ]; then
+        warn "Running as root: not starting the per-user launchd agent (re-run without sudo)."
+        SC_START_MODE=no
+    elif [ "$SC_START_MODE" != no ] && ! launchctl print "$SC_DOMAIN" >/dev/null 2>&1; then
+        warn "No GUI login session for this user (SSH?); the launchd agent cannot start from here."
+        SC_START_MODE=no
+    fi
+    if [ "$SC_START_MODE" = ask ]; then
+        if launchctl print "$SC_TARGET" 2>/dev/null | grep -q 'state = running'; then
+            SC_RUNNING=1
+            SC_QUESTION="SynapCores is already running; restart it on ${PINNED_VERSION} now?"
+        else
+            SC_QUESTION="Start SynapCores now?"
+        fi
+        log "Starting records your acceptance of the SynapCores license (read it: ${INSTALLED_BIN} --license)."
+        printf '\033[1;34m[get-synapcores]\033[0m %s [Y/n] ' "$SC_QUESTION" >/dev/tty || true
+        read -r SC_ANSWER </dev/tty || SC_ANSWER="n"
+        case "$SC_ANSWER" in
+            ""|[Yy]*) ;;
+            *) SC_START_MODE=no ;;
+        esac
+    fi
 
+    SC_STARTED=skipped
+    if [ "$SC_START_MODE" != no ]; then
+        if mac_start_agent; then SC_STARTED=0; else SC_STARTED=$?; fi
+    fi
+
+    if [ "$SC_STARTED" = 0 ]; then
+        # The engine prints its first-boot banner (admin password + a one-time
+        # OpenClaw memory API key) to stderr once, before it binds the port;
+        # launchd appends stderr to SC_ERR_LOG. Read only this start's bytes.
+        SC_ADMIN_PW=""
+        if [ -f "$SC_ERR_LOG" ]; then
+            SC_ADMIN_PW=$(tail -c "+$((SC_ERR_OFFSET + 1))" "$SC_ERR_LOG" 2>/dev/null \
+                | sed -n '/FIRST-BOOT CREDENTIALS/,/Change it via the admin UI/s/^  password: //p' \
+                | head -n 1) || SC_ADMIN_PW=""
+        fi
+        log "SynapCores is running under launchd. Web UI: ${SC_UI}"
+        if [ -z "$SC_ADMIN_PW" ]; then
+            log "No first-boot credentials in this start's log. A fresh data directory prints them"
+            log "once (look for FIRST-BOOT CREDENTIALS in ${SC_ERR_LOG}); an existing one keeps its admin."
+        elif [ "$SC_START_MODE" = ask ]; then
+            # Interactive only, and to the terminal rather than stdout, so a
+            # piped or captured install log never holds the password.
+            printf '\n  Admin login (generated once; also in %s):\n    username: admin\n    password: %s\n  Change it after you sign in.\n\n' \
+                "$SC_ERR_LOG" "$SC_ADMIN_PW" >/dev/tty || true
+            log "The same banner holds a one-time OpenClaw memory API key; see ${SC_ERR_LOG}."
+        else
+            log "First-boot credentials (admin password, OpenClaw memory API key) are in"
+            log "${SC_ERR_LOG}; non-interactive runs do not echo them."
+        fi
+        cat <<MAC_RUNNING_EOF
+
+[get-synapcores] Done — SynapCores is running
+
+  Web UI:  ${SC_UI}
+  Status:  launchctl print ${SC_TARGET}
+  Logs:    ${SC_HOME}/logs/
+  Stop:    launchctl bootout ${SC_TARGET}
+
+launchd also starts it at every login; to turn that off:  launchctl disable ${SC_TARGET}
+
+MAC_RUNNING_EOF
+        exit 0
+    fi
+
+    if [ "$SC_STARTED" = 2 ]; then
+        warn "No answer from ${SC_HEALTH_URL} after ${START_TIMEOUT}s; it may still be starting."
+        warn "Check:  curl -fsS ${SC_HEALTH_URL}   and   launchctl print ${SC_TARGET}"
+        warn "First-start admin password: look for FIRST-BOOT CREDENTIALS in ${SC_ERR_LOG}"
+    else
+        if [ "$SC_STARTED" = 1 ] && [ "$SC_BOOTSTRAPPED" = 1 ] && [ -f "$SC_ERR_LOG" ]; then
+            warn "Last lines of ${SC_ERR_LOG} from this start (secrets removed):"
+            tail -c "+$((SC_ERR_OFFSET + 1))" "$SC_ERR_LOG" 2>/dev/null | tail -n 15 \
+                | sed -e '/password:/d' -e '/API key:/d' >&2 || true
+        fi
+        if [ "$SC_STARTED" = 1 ]; then
+            SC_DONE="Done — SynapCores is installed but not running"
+        elif [ "$SC_RUNNING" = 1 ]; then
+            SC_DONE="Done — the running gateway keeps the previous version until restarted"
+        else
+            SC_DONE="Done — start the gateway"
+        fi
+        cat <<MAC_FINISH_EOF
+
+[get-synapcores] ${SC_DONE}
+
+Start the prepared launchd agent (launchd also starts it at every login):
+  launchctl bootstrap ${SC_DOMAIN} "${SC_PLIST}"
+  launchctl print ${SC_TARGET}
+If launchctl print already lists it (an earlier start or version), unload it first:
+  launchctl bootout ${SC_TARGET}
+
+Or run it in the foreground:
   "${START_HELPER}" --env-file "${SC_ENV_FILE}" --binary "${INSTALLED_BIN}" --config "${SC_CONFIG}"
 
-The first start prints an admin password — capture it from the log
-output. Then open the Web UI at http://localhost:8080/
-
-(Optional) start the prepared launchd agent:
-  launchctl bootstrap "gui/$(id -u)" "${SC_PLIST}"
-  launchctl print "gui/$(id -u)/com.synapcores.gateway"
+The first start prints an admin password once (launchd: ${SC_ERR_LOG};
+foreground: this terminal) — capture it. Then open the Web UI at ${SC_UI}
 
 A fatal start stops without an automatic restart loop. Inspect private logs under
 ${SC_HOME}/logs, fix the error, then start again deliberately. The helper checks
 configured HTTP/HTTPS ports before launching; it never stops their current owner.
 
 MAC_FINISH_EOF
+    fi
+    # An explicit SYNAPCORES_START=1 that did not end with a healthy gateway is
+    # a failure for automation; interactive runs keep the install's success.
+    if [ "$START_NOW" = 1 ]; then
+        exit 1
+    fi
     exit 0
 fi
 
