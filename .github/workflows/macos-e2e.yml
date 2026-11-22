@@ -157,6 +157,24 @@ jobs:
           print("signed in: access_token present")
           EOF
 
+      - name: "Data lake on a fresh install (report only)"
+        if: always()
+        run: |
+          [ -f "$RUNNER_TEMP/login.json" ] || { echo "no sign-in, skipping"; exit 0; }
+          tok=$(python3 -c 'import json, sys; d = json.load(open(sys.argv[1])); print(d.get("access_token") or (d.get("data") or {}).get("access_token") or "")' "$RUNNER_TEMP/login.json")
+          [ -n "$tok" ] || { echo "no token, skipping"; exit 0; }
+          echo "::add-mask::$tok"
+          for path in /v1/lake/jobs /v1/lake/destinations; do
+            code=$(curl -s -o "$RUNNER_TEMP/lake.json" -w '%{http_code}' -H "Authorization: Bearer $tok" "http://127.0.0.1:8080$path")
+            msg=$(head -c 400 "$RUNNER_TEMP/lake.json" | tr '\n' ' ')
+            echo "GET $path -> HTTP $code: $msg"
+            [ "$code" = 503 ] && echo "::warning::Data lake unavailable on a fresh install ($path -> 503): $msg"
+          done
+          echo "--- engine log files"; ls -la ~/.synapcores/logs/ 2>/dev/null || true
+          echo "--- lake / encryption lines in engine logs"
+          grep -rhiE "data lake|lake credential|AIDB_ENCRYPTION_KEY" ~/.synapcores/logs/ 2>/dev/null | head -10 || true
+          exit 0
+
       - name: Logs, with passwords and keys redacted
         if: always()
         run: |
