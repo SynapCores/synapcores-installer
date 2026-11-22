@@ -34,7 +34,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        installer: [draft, live]
+        installer: [draft, live, draft-tty]
     env:
       COUNTER_OPT_OUT: "1"
       DO_NOT_TRACK: "1"
@@ -42,7 +42,7 @@ jobs:
       SYNAPCORES_NO_MODEL_DOWNLOAD: "1"
       SYNAPCORES_NONINTERACTIVE: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Runner facts
         run: |
@@ -54,7 +54,7 @@ jobs:
 
       - name: Pick the installer
         run: |
-          if [ "${{ matrix.installer }}" = draft ]; then
+          if [ "${{ matrix.installer }}" != live ]; then
             cp install.sh "$RUNNER_TEMP/installer.sh"
           else
             curl -fsSL https://get.synapcores.com -o "$RUNNER_TEMP/installer.sh"
@@ -67,6 +67,7 @@ jobs:
           (umask 077; printf 'export DO_NOT_TRACK=1\nexport SYNAPCORES_TELEMETRY=off\n' > ~/.synapcores/synapcores.env)
 
       - name: "Step 1: a Mac without Homebrew"
+        if: matrix.installer != 'draft-tty'
         run: |
           sudo mv /opt/homebrew /opt/homebrew.hidden
           set +e
@@ -85,9 +86,20 @@ jobs:
           fi
 
       - name: "Step 2: install SynapCores (Homebrew present)"
+        if: matrix.installer != 'draft-tty'
         run: |
           export SYNAPCORES_START=1   # draft: start via launchd at the end; ignored by the live installer
           sh "$RUNNER_TEMP/installer.sh" < /dev/null 2>&1 | tee "$RUNNER_TEMP/install.log"
+
+      - name: "Step 2 in a real terminal: curl | sh, pressing Enter at every prompt"
+        if: matrix.installer == 'draft-tty'
+        run: |
+          # A person in Terminal: stdin is the piped script, the prompts read /dev/tty.
+          # script(1) gives the installer a terminal; each newline is one press of Enter.
+          unset SYNAPCORES_NONINTERACTIVE SYNAPCORES_START
+          printf '\n\n\n\n\n\n\n\n\n\n' | script -q /dev/null sh -c 'cat "$RUNNER_TEMP/installer.sh" | sh' 2>&1 | tr -d '\r' | tee "$RUNNER_TEMP/install.log"
+          grep -q "SynapCores is running" "$RUNNER_TEMP/install.log" \
+            || { echo "::error::Pressing Enter at the start prompt did not start SynapCores"; exit 1; }
 
       - name: "Step 3: start SynapCores (live installer: the documented launchctl command)"
         if: matrix.installer == 'live'
@@ -135,7 +147,7 @@ jobs:
           done
           ls -la "$RUNNER_TEMP/out"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         if: always()
         with:
           name: macos-${{ matrix.installer }}-logs
