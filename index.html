@@ -50,7 +50,7 @@
 # bash can run after the binary is on disk.
 #
 # What it does:
-#   1. Detects the OS and architecture
+#   1. Detects the OS and architecture (on macOS, also checks for Homebrew)
 #   2. Resolves the latest GitHub release tag (or honors $SYNAPCORES_VERSION)
 #   3. Downloads the matching binary tarball + checksum
 #   4. Verifies the checksum
@@ -395,6 +395,70 @@ case "$PLATFORM" in
         check_distro
         ;;
 esac
+
+# ---------------------------------------------------------------------
+# macOS: check for Homebrew first
+# ---------------------------------------------------------------------
+
+# Command to re-run this install: keeps the attribution tag and the choices
+# that change what gets installed (sanitized the same way as the counter).
+mac_rerun_command() {
+    _rr_env=""
+    _rr_ref=$(printf '%s' "${SYNAPCORES_REF:-}" | LC_ALL=C tr -cd 'A-Za-z0-9_-' | cut -c1-40)
+    [ -z "$_rr_ref" ] || _rr_env="${_rr_env}SYNAPCORES_REF=${_rr_ref} "
+    _rr_ver=$(printf '%s' "${SYNAPCORES_VERSION:-}" | LC_ALL=C tr -cd 'A-Za-z0-9._-' | cut -c1-40)
+    [ -z "$_rr_ver" ] || _rr_env="${_rr_env}SYNAPCORES_VERSION=${_rr_ver} "
+    [ -z "$USER_INSTALL" ] || _rr_env="${_rr_env}SYNAPCORES_USER_INSTALL=1 "
+    [ -z "${COUNTER_OPT_OUT:-}" ] || _rr_env="${_rr_env}COUNTER_OPT_OUT=1 "
+    printf 'curl -fsSL https://get.synapcores.com | %ssh\n' "$_rr_env"
+}
+
+# mac_require_brew: put Homebrew on PATH, or print the exact steps to install it
+# and exit 1. Right after a fresh Homebrew install, brew is not on PATH until the
+# user runs Homebrew's "Next steps" shellenv line, so also look in the standard
+# prefixes (PATH wins, so custom installs and test fixtures still apply).
+# Call it directly, not in $(...), so the PATH update and the exit take effect.
+mac_require_brew() {
+    if ! command -v brew >/dev/null 2>&1; then
+        for SC_BREW in /opt/homebrew/bin/brew /usr/local/bin/brew; do
+            if [ -x "$SC_BREW" ]; then
+                PATH="${SC_BREW%/brew}:${PATH}"
+                export PATH
+                log "Using Homebrew at ${SC_BREW} (it is not on this shell's PATH yet)."
+                break
+            fi
+        done
+    fi
+    if ! command -v brew >/dev/null 2>&1; then
+        SC_RERUN=$(mac_rerun_command)
+        cat >&2 <<BREW_MISSING_EOF
+
+[get-synapcores] Homebrew is required for the macOS runtime deps (ffmpeg, tesseract, leptonica).
+
+  1. Install Homebrew with the official command from https://brew.sh:
+
+       /bin/bash -c "\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+  2. Run the "Next steps" lines Homebrew prints at the end, so brew is on your PATH.
+     For the current Terminal window on Apple Silicon:
+
+       eval "\$(/opt/homebrew/bin/brew shellenv)"
+
+  3. Re-run this installer (it also finds /opt/homebrew/bin/brew without step 2):
+
+       ${SC_RERUN}
+
+BREW_MISSING_EOF
+        exit 1
+    fi
+}
+
+# Fail fast: on a Mac without Homebrew, stop here, before the version lookup,
+# the install counter, the download, any sudo prompt and any file writes.
+# Binary-only installs never reach the deps step, so they skip it as before.
+if [ "$DETECTED_OS" = "darwin" ] && [ -z "$BINARY_ONLY" ]; then
+    mac_require_brew
+fi
 
 # ---------------------------------------------------------------------
 # Resolve version
@@ -763,19 +827,6 @@ if [ -n "$BINARY_ONLY" ]; then
     exit 0
 fi
 
-# Command to re-run this install: keeps the attribution tag and the choices
-# that change what gets installed (sanitized the same way as the counter).
-mac_rerun_command() {
-    _rr_env=""
-    _rr_ref=$(printf '%s' "${SYNAPCORES_REF:-}" | LC_ALL=C tr -cd 'A-Za-z0-9_-' | cut -c1-40)
-    [ -z "$_rr_ref" ] || _rr_env="${_rr_env}SYNAPCORES_REF=${_rr_ref} "
-    _rr_ver=$(printf '%s' "${SYNAPCORES_VERSION:-}" | LC_ALL=C tr -cd 'A-Za-z0-9._-' | cut -c1-40)
-    [ -z "$_rr_ver" ] || _rr_env="${_rr_env}SYNAPCORES_VERSION=${_rr_ver} "
-    [ -z "$USER_INSTALL" ] || _rr_env="${_rr_env}SYNAPCORES_USER_INSTALL=1 "
-    [ -z "${COUNTER_OPT_OUT:-}" ] || _rr_env="${_rr_env}COUNTER_OPT_OUT=1 "
-    printf 'curl -fsSL https://get.synapcores.com | %ssh\n' "$_rr_env"
-}
-
 # Load the prepared launchd agent and wait for /health. Returns 0 when the
 # gateway answers under launchd, 1 when it was not started or exited (reason
 # printed), 2 when it is loaded but gave no answer within START_TIMEOUT.
@@ -862,41 +913,9 @@ mac_start_agent() {
 # missing deps automatically (CI / automation).
 
 if [ "$DETECTED_OS" = "darwin" ]; then
-    # Right after a fresh Homebrew install, brew is not on PATH until the user
-    # runs Homebrew's "Next steps" shellenv line, so also look in the standard
-    # prefixes (PATH wins, so custom installs and test fixtures still apply).
-    if ! command -v brew >/dev/null 2>&1; then
-        for SC_BREW in /opt/homebrew/bin/brew /usr/local/bin/brew; do
-            if [ -x "$SC_BREW" ]; then
-                PATH="${SC_BREW%/brew}:${PATH}"
-                export PATH
-                log "Using Homebrew at ${SC_BREW} (it is not on this shell's PATH yet)."
-                break
-            fi
-        done
-    fi
-    if ! command -v brew >/dev/null 2>&1; then
-        SC_RERUN=$(mac_rerun_command)
-        cat >&2 <<BREW_MISSING_EOF
-
-[get-synapcores] Homebrew is required for the macOS runtime deps (ffmpeg, tesseract, leptonica).
-
-  1. Install Homebrew with the official command from https://brew.sh:
-
-       /bin/bash -c "\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-
-  2. Run the "Next steps" lines Homebrew prints at the end, so brew is on your PATH.
-     For the current Terminal window on Apple Silicon:
-
-       eval "\$(/opt/homebrew/bin/brew shellenv)"
-
-  3. Re-run this installer (it also finds /opt/homebrew/bin/brew without step 2):
-
-       ${SC_RERUN}
-
-BREW_MISSING_EOF
-        exit 1
-    fi
+    # Same shared check as before the download (it passed there, so this finds
+    # the same brew); kept here so the deps step never runs without it.
+    mac_require_brew
     case "$(command -v brew)" in
         /usr/local/*)
             warn "Using the Intel (Rosetta) Homebrew at $(command -v brew). This Apple Silicon build"
