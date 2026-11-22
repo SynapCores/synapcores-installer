@@ -91,13 +91,27 @@ jobs:
           export SYNAPCORES_START=1   # draft: start via launchd at the end; ignored by the live installer
           sh "$RUNNER_TEMP/installer.sh" < /dev/null 2>&1 | tee "$RUNNER_TEMP/install.log"
 
-      - name: "Step 2 in a real terminal: curl | sh, pressing Enter at every prompt"
+      - name: "Step 2 in a real terminal: curl | sh, pressing Enter at each prompt"
         if: matrix.installer == 'draft-tty'
         run: |
           # A person in Terminal: stdin is the piped script, the prompts read /dev/tty.
-          # script(1) gives the installer a terminal; each newline is one press of Enter.
+          # expect gives the installer a terminal and presses Enter only once a prompt is
+          # showing (input typed ahead is eaten by sudo's terminal relay). The one exception
+          # is the multi-GB model pre-pull, answered "n" to keep the run short.
           unset SYNAPCORES_NONINTERACTIVE SYNAPCORES_START
-          printf '\n\n\n\n\n\n\n\n\n\n' | script -q /dev/null sh -c 'cat "$RUNNER_TEMP/installer.sh" | sh' 2>&1 | tr -d '\r' | tee "$RUNNER_TEMP/install.log"
+          cat > "$RUNNER_TEMP/enter.exp" <<'EXP'
+          set timeout 1200
+          spawn sh -c {cat "$RUNNER_TEMP/installer.sh" | sh}
+          expect {
+            -re {Pre-pull[^\n]*\[Y/n\] $} { send "n\r"; exp_continue }
+            -re {\[(Y/n|y/N|1/2)\][^\n]*$} { send "\r"; exp_continue }
+            timeout { puts "\nTIMEOUT waiting for the installer"; exit 124 }
+            eof
+          }
+          catch wait result
+          exit [lindex $result 3]
+          EXP
+          expect "$RUNNER_TEMP/enter.exp" 2>&1 | tr -d '\r' | tee "$RUNNER_TEMP/install.log"
           grep -q "SynapCores is running" "$RUNNER_TEMP/install.log" \
             || { echo "::error::Pressing Enter at the start prompt did not start SynapCores"; exit 1; }
 
