@@ -115,9 +115,16 @@ jobs:
           grep -q "SynapCores is running" "$RUNNER_TEMP/install.log" \
             || { echo "::error::Pressing Enter at the start prompt did not start SynapCores"; exit 1; }
 
-      - name: "Step 3: start SynapCores (live installer: the documented launchctl command)"
+      - name: "Step 3: start SynapCores (live installer: the documented launchctl command if it isn't running yet)"
         if: matrix.installer == 'live'
-        run: launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.synapcores.gateway.plist
+        run: |
+          # An installer that started SynapCores itself (SYNAPCORES_START=1) needs no second start;
+          # bootstrapping a loaded agent fails with error 5.
+          if launchctl print "gui/$(id -u)/com.synapcores.gateway" >/dev/null 2>&1; then
+            echo "Already running: the installer started it."
+          else
+            launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.synapcores.gateway.plist
+          fi
 
       - name: Wait for /health
         run: |
